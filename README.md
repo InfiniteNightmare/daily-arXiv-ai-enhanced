@@ -26,6 +26,13 @@ This innovative tool transforms how you stay updated with arXiv papers by combin
 - Local preference storage for privacy
 - Flexible date range filtering
 
+🧩 **SKILL System**
+- Plug-and-play skill modules for customizing paper filtering
+
+⚙️ **Easy Preference Export & Integration**
+- One-click copy in Settings to export your keywords and authors configuration
+- Seamlessly combine exported preferences with SKILL for reproducible and shareable setups
+
 👉 **[Try it now!](https://dw-dengwei.github.io/daily-arXiv-ai-enhanced/)** - No installation required
 
 
@@ -41,7 +48,7 @@ If you wish to crawl other arXiv categories, use other LLMs, or other languages,
 Otherwise, you can directly use this repo in https://dw-dengwei.github.io/daily-arXiv-ai-enhanced/. Please star it if you like :)
 
 **Instructions:**
-1. Fork this repo to your own account and delete my own information in [by-me-a-coffee](./buy-me-a-coffee/README.md).
+1. Fork this repo to your own account and delete my own information in [buy-me-a-coffee](./buy-me-a-coffee/README.md).
 2. Go to: your-own-repo -> Settings -> Secrets and variables -> Actions
 3. Go to Secrets. Secrets are encrypted and used for sensitive data
 4. Create two repository secrets named `OPENAI_API_KEY` and `OPENAI_BASE_URL`, and input corresponding values.

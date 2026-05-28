@@ -229,7 +229,7 @@ function getJsonParam() {
 function getUrlAuthor() {
   const params = new URLSearchParams(window.location.search);
   const author = params.get('author');
-  return author ? decodeURIComponent(author) : null;
+  return author ? decodeURIComponent(author).split(',').map(k => k.trim()).filter(k => k) : null;
 }
 
 // 从URL参数中获取keywords
@@ -258,7 +258,8 @@ function outputJsonData(papers, category) {
       categories: p.category,
       summary: p.summary,
       date: p.date,
-      url: p.url
+      url: p.url,
+      reason: p.matchReason
     }))
   };
 
@@ -312,16 +313,27 @@ function matchPapersByKeywords(papers, keywords) {
 }
 
 // 根据author匹配论文（复用现有逻辑）
-function matchPapersByAuthor(papers, author) {
-  if (!author) return papers.map(p => ({ ...p, isMatched: false, matchReason: null }));
+function matchPapersByAuthor(papers, query_authors) {
+  if (!query_authors) return papers.map(p => ({ ...p, isMatched: false, matchReason: null }));
 
   return papers.map(paper => {
-    const matches = paper.authors.toLowerCase().includes(author.toLowerCase());
-    return {
-      ...paper,
-      isMatched: matches,
-      matchReason: matches ? `作者: ${author}` : null
-    };
+    const matches = query_authors.some(author => {
+      const searchText = `${paper.authors}`.toLowerCase();
+      return searchText.includes(author.toLowerCase());
+    });
+
+    if (matches) {
+      const matchedAuthors = query_authors.filter(author => {
+        const searchText = `${paper.authors}`.toLowerCase();
+        return searchText.includes(author.toLowerCase());
+      });
+      return {
+        ...paper,
+        isMatched: true,
+        matchReason: matchedAuthors.length > 0 ? `作者: ${matchedAuthors.join(', ')}` : null
+      };
+    }
+    return { ...paper, isMatched: false, matchReason: null };
   });
 }
 

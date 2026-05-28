@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# 默认 URL
+# 参数1: URL，参数2: 超时时间（毫秒），默认60000（1分钟）
 url=${1:-"https://dw-dengwei.github.io/daily-arXiv-ai-enhanced/?category=cs.CV"}
+timeout=${2:-60000}
 
 # 检测 node 是否安装
 if ! command -v node &> /dev/null; then
@@ -42,7 +43,7 @@ const puppeteer = require('puppeteer');
 
     await page.goto('$url', {
       waitUntil: 'networkidle0',
-      timeout: 60000
+      timeout: $timeout
     });
 
     const content = await page.evaluate(() => document.body.innerText);

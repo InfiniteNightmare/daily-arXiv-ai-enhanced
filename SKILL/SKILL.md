@@ -1,7 +1,7 @@
 ---
 name: daily-arxiv-ai-enhanced
-description: 通过URL请求，从daily-arxiv-ai-enhanced项目中获取论文数据
-license: Apache-2.0
+version: 0.1
+description: 通过URL请求，从daily-arxiv-ai-enhanced项目中获取论文json数据
 ---
 
 # arXiv论文数据API
@@ -19,7 +19,7 @@ https://dw-dengwei.github.io/daily-arXiv-ai-enhanced/
 
 | 参数 | 说明 | 示例 |
 |------|------|------|
-| `category` | arXiv类别 | `cs.CV`, `cs.AI`, `all` |
+| `category` | arXiv类别 | `cs.CV`, `cs.AI`, etc. |
 | `author` | 作者姓名 | `Smith` |
 | `keywords` | 关键词，逗号分隔 | `vision,learning` |
 
@@ -54,7 +54,7 @@ category AND (keywords OR author)
       "title": "标题",
       "authors": "作者1, 作者2",
       "categories": ["cs.CV"],
-      "summary": "摘要",
+      "summary": "tldr",
       "date": "2024-01-01",
       "url": "https://arxiv.org/abs/2401.00001"
     }
