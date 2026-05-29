@@ -15,7 +15,11 @@ from datetime import datetime, timedelta
 class DailyArxivPipeline:
     def __init__(self):
         self.page_size = 100
-        self.client = arxiv.Client(self.page_size)
+        self.client = arxiv.Client(
+            page_size=self.page_size,
+            delay_seconds=float(os.environ.get("ARXIV_API_DELAY_SECONDS", "3")),
+            num_retries=int(os.environ.get("ARXIV_API_NUM_RETRIES", "8")),
+        )
 
     def process_item(self, item: dict, spider):
         item["pdf"] = f"https://arxiv.org/pdf/{item['id']}"
@@ -23,10 +27,23 @@ class DailyArxivPipeline:
         search = arxiv.Search(
             id_list=[item["id"]],
         )
-        paper = next(self.client.results(search))
-        item["authors"] = [a.name for a in paper.authors]
-        item["title"] = paper.title
-        item["categories"] = paper.categories
-        item["comment"] = paper.comment
-        item["summary"] = paper.summary
+        try:
+            paper = next(self.client.results(search))
+            item["authors"] = [a.name for a in paper.authors]
+            item["title"] = paper.title
+            item["categories"] = paper.categories
+            item["comment"] = paper.comment
+            item["summary"] = paper.summary
+        except Exception as exc:
+            spider.logger.error("Failed to fetch arXiv metadata for %s: %s", item["id"], exc)
+            item.setdefault("authors", [])
+            item.setdefault("title", item["id"])
+            item.setdefault("categories", item.get("categories", []))
+            item.setdefault("comment", None)
+            item.setdefault(
+                "summary",
+                "arXiv metadata fetch failed after retries. Original paper links and ID are preserved.",
+            )
+            item["metadata_status"] = "fallback"
+            item["metadata_error"] = str(exc)[:500]
         return item

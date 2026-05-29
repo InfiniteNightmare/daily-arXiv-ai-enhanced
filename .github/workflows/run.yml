@@ -5,8 +5,13 @@ name: arXiv-daily-ai-enhanced
 
 on:
   schedule:
-    - cron: "30 1 * * *"
+    - cron: "30 1 * * 1-5"
   workflow_dispatch:
+    inputs:
+      process_date:
+        description: "Date to process in YYYY-MM-DD; leave empty to use today's UTC date"
+        required: false
+        type: string
 
 
 jobs:
@@ -21,144 +26,157 @@ jobs:
         curl -LsSf https://astral.sh/uv/install.sh | sh
         uv sync
         
-    - name: Crawl arXiv papers
+    - name: Stream crawl and AI enhancement
       id: crawl_step
       run: |
         source .venv/bin/activate
-        today=$(date -u "+%Y-%m-%d")
-        echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
-        
-        # 检查今日文件是否已存在，如存在则删除 / Check if today's file exists, delete if found
-        if [ -f "data/${today}.jsonl" ]; then
-            echo "🗑️ 发现今日文件已存在，正在删除重新生成... / Found existing today's file, deleting for fresh start..."
-            rm "data/${today}.jsonl"
-            echo "✅ 已删除现有文件：data/${today}.jsonl / Deleted existing file: data/${today}.jsonl"
+        requested_date="${{ github.event.inputs.process_date }}"
+        if [ -n "$requested_date" ]; then
+          today="$requested_date"
         else
-            echo "📝 今日文件不存在，准备新建... / Today's file doesn't exist, ready to create new one..."
+          today=$(date -u "+%Y-%m-%d")
         fi
-        
-        cd daily_arxiv
+        current_utc_date=$(date -u "+%Y-%m-%d")
+        if [[ ! "$today" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+          echo "Invalid process_date: $today. Expected YYYY-MM-DD."
+          exit 1
+        fi
+        language="${{ vars.LANGUAGE }}"
+        categories="${{ vars.CATEGORIES }}"
+        model_name="${{ vars.MODEL_NAME }}"
+        ai_max_workers="${{ vars.AI_MAX_WORKERS }}"
+        ai_min_interval_seconds="${{ vars.AI_MIN_INTERVAL_SECONDS }}"
+        ai_retry_attempts="${{ vars.AI_RETRY_ATTEMPTS }}"
+        ai_retry_base_seconds="${{ vars.AI_RETRY_BASE_SECONDS }}"
+        ai_retry_max_seconds="${{ vars.AI_RETRY_MAX_SECONDS }}"
+        ai_circuit_breaker_failures="${{ vars.AI_CIRCUIT_BREAKER_FAILURES }}"
+        if [ -z "$language" ]; then language="Chinese"; fi
+        if [ -z "$categories" ]; then categories="cs.CV"; fi
+        if [ -z "$model_name" ]; then model_name="deepseek-chat"; fi
+        if [ -z "$ai_max_workers" ]; then ai_max_workers="1"; fi
+        if [ -z "$ai_min_interval_seconds" ]; then ai_min_interval_seconds="3"; fi
+        if [ -z "$ai_retry_attempts" ]; then ai_retry_attempts="4"; fi
+        if [ -z "$ai_retry_base_seconds" ]; then ai_retry_base_seconds="10"; fi
+        if [ -z "$ai_retry_max_seconds" ]; then ai_retry_max_seconds="180"; fi
+        if [ -z "$ai_circuit_breaker_failures" ]; then ai_circuit_breaker_failures="80"; fi
+        echo "开始流式爬取和AI增强 $today 的arXiv论文... / Starting streaming crawl and AI enhancement for $today..."
+
+        mkdir -p data assets
+        git fetch origin +refs/heads/data:refs/remotes/origin/data || true
+        git checkout origin/data -- data assets/file-list.txt 2>/dev/null || true
+
+        rm -f "data/${today}_AI_enhanced_${language}.jsonl"
+        rm -f "data/${today}.md"
+
         export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
         export OPENAI_BASE_URL=${{ secrets.OPENAI_BASE_URL }}
         export TOKEN_GITHUB=${{ secrets.TOKEN_GITHUB }}
-        export LANGUAGE="${{ vars.LANGUAGE }}"
-        export CATEGORIES="${{ vars.CATEGORIES }}"
-        export MODEL_NAME="${{ vars.MODEL_NAME }}"
-        
-        # 使用Scrapy爬取
-        # Use Scrapy to crawl
-        scrapy crawl arxiv -o ../data/${today}.jsonl
-        
-        # 检查爬取是否成功 / Check if crawling was successful
-        if [ ! -f "../data/${today}.jsonl" ]; then
-            echo "爬取失败，未生成数据文件 / Crawling failed, no data file generated"
+        export LANGUAGE="$language"
+        export CATEGORIES="$categories"
+        export MODEL_NAME="$model_name"
+        export AI_MAX_WORKERS="$ai_max_workers"
+        export AI_MIN_INTERVAL_SECONDS="$ai_min_interval_seconds"
+        export AI_RETRY_ATTEMPTS="$ai_retry_attempts"
+        export AI_RETRY_BASE_SECONDS="$ai_retry_base_seconds"
+        export AI_RETRY_MAX_SECONDS="$ai_retry_max_seconds"
+        export AI_CIRCUIT_BREAKER_FAILURES="$ai_circuit_breaker_failures"
+        export SENSITIVE_CHECK_ENABLED="${{ vars.SENSITIVE_CHECK_ENABLED }}"
+        export ARXIV_METADATA_BATCH_SIZE="${{ vars.ARXIV_METADATA_BATCH_SIZE }}"
+
+        if [ -s "data/${today}.jsonl" ]; then
+          echo "发现已存在的原始数据，重新运行AI增强 / Found existing raw data, rerunning AI enhancement"
+          set +e
+          python ai/enhance.py --data "data/${today}.jsonl" --max_workers "$ai_max_workers"
+          stream_exit_code=$?
+          set -e
+        else
+          if [ -n "$requested_date" ] && [ "$today" != "$current_utc_date" ]; then
+            echo "历史日期 $today 在 data 分支没有原始数据，不能用 /new 页面伪造回填 / Historical date $today has no raw data on data branch; refusing to backfill from /new"
             exit 1
+          fi
+
+          rm -f "data/${today}.jsonl"
+          cd daily_arxiv
+          set +e
+          python stream_crawl_enhance.py --date "$today"
+          stream_exit_code=$?
+          set -e
+          cd ..
         fi
-        
+
         echo "crawl_date=$today" >> $GITHUB_OUTPUT
-        echo "爬取完成 / Crawling completed"
-        
-    - name: Check for duplicates
-      id: dedup_check
-      run: |
-        source .venv/bin/activate
-        echo "执行去重检查... / Performing intelligent deduplication check..."
-        
-        cd daily_arxiv
-        # 执行去重检查脚本 / Execute intelligent deduplication check script
-        set +e  # 暂时允许命令失败 / Temporarily allow command failure
-        python daily_arxiv/check_stats.py
-        
-        # 获取退出码 / Get exit code
-        dedup_exit_code=$?
-        set -e  # 恢复严格模式 / Restore strict mode
-        
-        echo "去重检查退出码: $dedup_exit_code / Dedup check exit code: $dedup_exit_code"
-        echo "dedup_exit_code=$dedup_exit_code" >> $GITHUB_OUTPUT
-        
-        case $dedup_exit_code in
+        echo "stream_exit_code=$stream_exit_code" >> $GITHUB_OUTPUT
+
+        case $stream_exit_code in
             0)
                 echo "has_new_content=true" >> $GITHUB_OUTPUT
+                AI_FILE="data/${today}_AI_enhanced_${LANGUAGE}.jsonl"
+                if [ ! -s "data/${today}.jsonl" ]; then
+                    echo "爬取失败，未生成非空数据文件 / Crawling failed, no non-empty data file generated"
+                    exit 1
+                fi
+                if [ ! -s "$AI_FILE" ]; then
+                    echo "AI处理失败：增强文件为空 / AI processing failed: enhanced file is empty"
+                    echo "AI文件: $AI_FILE"
+                    exit 1
+                fi
+                echo "流式爬取和AI增强完成 / Streaming crawl and AI enhancement completed"
                 ;;
             1)
                 echo "has_new_content=false" >> $GITHUB_OUTPUT
                 echo "skip_reason=no_new_content" >> $GITHUB_OUTPUT
+                echo "去重后无新内容 / No new content after deduplication"
                 ;;
-            2)
+            *)
+                echo "❌ 流式处理失败，停止工作流 / Streaming processing failed, stop workflow"
                 echo "has_new_content=false" >> $GITHUB_OUTPUT
                 echo "skip_reason=processing_error" >> $GITHUB_OUTPUT
                 exit 1
                 ;;
-            *)
-                echo "❌ 未知退出码，停止工作流 / Unknown exit code, stop workflow"
-                echo "has_new_content=false" >> $GITHUB_OUTPUT
-                echo "skip_reason=unknown_error" >> $GITHUB_OUTPUT
-                exit 1
-                ;;
         esac
-        
-    - name: AI Enhancement Processing
-      if: steps.dedup_check.outputs.has_new_content == 'true'
-      run: |
-        source .venv/bin/activate
-        today=${{ steps.crawl_step.outputs.crawl_date }}
-        echo "开始AI增强处理... / Starting AI enhancement processing..."
-        
-        cd ai
-        export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-        export OPENAI_BASE_URL=${{ secrets.OPENAI_BASE_URL }}
-        export LANGUAGE="${{ vars.LANGUAGE }}"
-        export MODEL_NAME="${{ vars.MODEL_NAME }}"
-        
-        python enhance.py --data ../data/${today}.jsonl
-        
-        # 检查AI处理是否成功 / Check if AI processing was successful
-        if [ $? -ne 0 ]; then
-            echo "AI处理失败 / AI processing failed"
-            exit 1
-        fi
-        echo "AI增强处理完成 / AI enhancement processing completed"
-        
+
     - name: Convert to Markdown
-      if: steps.dedup_check.outputs.has_new_content == 'true'
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         source .venv/bin/activate
         today=${{ steps.crawl_step.outputs.crawl_date }}
+        language="${{ vars.LANGUAGE }}"
+        if [ -z "$language" ]; then language="Chinese"; fi
         echo "转换为Markdown格式... / Converting to Markdown format..."
-        
+
         # 设置环境变量 / Set environment variables
-        export LANGUAGE="${{ vars.LANGUAGE }}"
-        
+        export LANGUAGE="$language"
+
         cd to_md
-        
+
         # 使用AI增强文件进行转换 / Use AI enhanced file for conversion
         AI_FILE="../data/${today}_AI_enhanced_${LANGUAGE}.jsonl"
-        
-        if [ -f "$AI_FILE" ]; then
+
+        if [ -s "$AI_FILE" ]; then
             echo "使用AI增强文件进行转换... / Using AI enhanced file for conversion..."
             python convert.py --data "$AI_FILE"
         else
-            echo "错误：未找到AI增强文件 / Error: AI enhanced file not found"
+            echo "错误：未找到非空AI增强文件 / Error: non-empty AI enhanced file not found"
             echo "AI文件: $AI_FILE"
             exit 1
         fi
-        
+
         # 检查转换是否成功 / Check if conversion was successful
         if [ $? -ne 0 ]; then
             echo "Markdown转换失败 / Markdown conversion failed"
             exit 1
         fi
         echo "Markdown转换完成 / Markdown conversion completed"
-        
+
     - name: Update file list
-      if: steps.dedup_check.outputs.has_new_content == 'true'
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         echo "更新文件列表... / Updating file list..."
         ls data/*.jsonl | sed 's|data/||' > assets/file-list.txt
         echo "文件列表更新完成 / File list updated"
 
     - name: Generate password hash and inject into config
-      if: steps.dedup_check.outputs.has_new_content == 'true'
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         echo "🔐 Generating password hash for authentication..."
 
@@ -193,15 +211,15 @@ jobs:
 
     - name: Summary
       run: |
-        if [ "${{ steps.dedup_check.outputs.has_new_content }}" = "true" ]; then
-          echo "✅ 工作流完成：去重发现新内容并成功处理 / Workflow completed: Smart deduplication found new content and processed successfully"
+        if [ "${{ steps.crawl_step.outputs.has_new_content }}" = "true" ]; then
+          echo "✅ 工作流完成：流式爬取和AI增强成功处理新内容 / Workflow completed: Streaming crawl and AI enhancement processed new content"
         else
-          case "${{ steps.dedup_check.outputs.skip_reason }}" in
+          case "${{ steps.crawl_step.outputs.skip_reason }}" in
             "no_new_content")
-              echo "ℹ️ 工作流完成：去重后无新内容 / Workflow completed: No new content after smart deduplication"
+              echo "ℹ️ 工作流完成：去重后无新内容 / Workflow completed: No new content after deduplication"
               ;;
             "processing_error")
-              echo "⚠️ 工作流完成：去重处理出错 / Workflow completed: Deduplication processing error"
+              echo "⚠️ 工作流完成：流式处理出错 / Workflow completed: Streaming processing error"
               ;;
             "unknown_error")
               echo "⚠️ 工作流完成：未知错误 / Workflow completed: Unknown error"
@@ -213,7 +231,7 @@ jobs:
         fi
         
     - name: Inject repository info into data-config.js
-      if: steps.dedup_check.outputs.has_new_content == 'true'
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         echo "注入仓库信息到 data-config.js... / Injecting repository info into data-config.js..."
         
@@ -235,7 +253,7 @@ jobs:
         fi
 
     - name: Commit code changes to main branch
-      if: steps.dedup_check.outputs.has_new_content == 'true'
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         git config --global user.email "${{ vars.EMAIL }}"
         git config --global user.name "${{ vars.NAME }}"
@@ -257,7 +275,7 @@ jobs:
         fi
 
     - name: Push code changes to main branch
-      if: steps.dedup_check.outputs.has_new_content == 'true'
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         # 设置Git配置以处理自动合并 / Set Git config for automatic merging
         git config pull.rebase true
@@ -280,7 +298,7 @@ jobs:
         done
 
     - name: Prepare data files for data branch
-      if: steps.dedup_check.outputs.has_new_content == 'true'
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         echo "准备数据文件... / Preparing data files..."
         today=${{ steps.crawl_step.outputs.crawl_date }}
@@ -296,7 +314,7 @@ jobs:
         echo "数据文件已保存到临时目录 / Data files saved to temporary directory"
 
     - name: Setup and commit to data branch
-      if: steps.dedup_check.outputs.has_new_content == 'true'
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         git config --global user.email "${{ vars.EMAIL }}"
         git config --global user.name "${{ vars.NAME }}"
@@ -350,7 +368,7 @@ jobs:
         fi
 
     - name: Push data changes to data branch
-      if: steps.dedup_check.outputs.has_new_content == 'true'
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         # 设置Git配置以处理自动合并 / Set Git config for automatic merging
         git config pull.rebase true
