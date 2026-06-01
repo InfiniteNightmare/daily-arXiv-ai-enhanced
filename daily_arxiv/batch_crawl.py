@@ -2,13 +2,15 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
+import xml.etree.ElementTree as ET
 
-import arxiv
+import requests
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -17,11 +19,10 @@ if str(SCRIPT_DIR) not in sys.path:
 from stream_crawl_enhance import (
     ROOT_DIR,
     batched,
-    crawl_seed_papers,
     enhance,
     load_history_ids,
     normalize_arxiv_id,
-    paper_id_from_result,
+    parse_list_page,
     parse_categories,
     write_jsonl,
 )
@@ -30,6 +31,12 @@ from stream_crawl_enhance import (
 EXIT_NO_NEW_CONTENT = 1
 EXIT_PROCESSING_ERROR = 2
 EXIT_DEFERRED = 3
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_LIST_URL_TEMPLATE = "https://arxiv.org/list/{category}/new"
+ATOM_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "arxiv": "http://arxiv.org/schemas/atom",
+}
 
 
 class CrawlDeferred(RuntimeError):
@@ -67,6 +74,7 @@ def parse_args():
     parser.add_argument("--metadata-batch-size", type=int, default=env_int("ARXIV_METADATA_BATCH_SIZE", 20))
     parser.add_argument("--metadata-delay-seconds", type=float, default=env_float("ARXIV_API_DELAY_SECONDS", 6.0))
     parser.add_argument("--metadata-retries", type=int, default=env_int("ARXIV_API_NUM_RETRIES", 0, min_value=0))
+    parser.add_argument("--metadata-timeout", type=float, default=env_float("ARXIV_API_TIMEOUT_SECONDS", 30.0, min_value=0.1))
     parser.add_argument("--batch-retry-attempts", type=int, default=env_int("ARXIV_BATCH_RETRY_ATTEMPTS", 3))
     parser.add_argument("--batch-retry-base-seconds", type=float, default=env_float("ARXIV_BATCH_RETRY_BASE_SECONDS", 10.0))
     parser.add_argument("--list-retries", type=int, default=env_int("ARXIV_LIST_RETRY_ATTEMPTS", 5))
@@ -121,11 +129,157 @@ def ensure_metadata_budget(started_at: float, max_seconds: float):
         )
 
 
-def metadata_from_batch(client: arxiv.Client, seeds: List[Dict]) -> List[Dict]:
+def timeout_with_budget(timeout: float, started_at: float, max_seconds: float) -> float:
+    ensure_metadata_budget(started_at, max_seconds)
+    remaining = metadata_budget_remaining(started_at, max_seconds)
+    if remaining is None:
+        return timeout
+    return max(min(timeout, remaining), 0.1)
+
+
+def sleep_with_budget(delay: float, started_at: float, max_seconds: float):
+    remaining = metadata_budget_remaining(started_at, max_seconds)
+    if remaining is not None:
+        if remaining <= 0:
+            raise CrawlDeferred(
+                f"arXiv crawl did not complete within {max_seconds:.0f}s; "
+                "pending seed checkpoint was preserved for the next run"
+            )
+        delay = min(delay, remaining)
+    if delay > 0:
+        time.sleep(delay)
+    ensure_metadata_budget(started_at, max_seconds)
+
+
+class RequestLimiter:
+    def __init__(self, delay_seconds: float):
+        self.delay_seconds = max(delay_seconds, 0.0)
+        self.last_request_at = 0.0
+
+    def wait(self, started_at: float, max_seconds: float):
+        if self.delay_seconds <= 0:
+            self.last_request_at = time.monotonic()
+            return
+
+        now = time.monotonic()
+        wait_seconds = self.last_request_at + self.delay_seconds - now
+        if wait_seconds > 0:
+            sleep_with_budget(wait_seconds, started_at, max_seconds)
+            now = time.monotonic()
+        self.last_request_at = now
+
+
+def clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def http_get_with_timeout(session: requests.Session, url: str, timeout: float, **kwargs) -> requests.Response:
+    response = session.get(url, timeout=timeout, **kwargs)
+    if response.status_code == 200:
+        return response
+
+    error = requests.HTTPError(f"HTTP {response.status_code} for {response.url}")
+    error.response = response
+    raise error
+
+
+def retry_delay_for_exception(attempt: int, base_seconds: float, exc: Exception) -> float:
+    retry_after = enhance.parse_retry_after_seconds(exc)
+    if retry_after is not None:
+        return min(retry_after, 180.0)
+    return retry_delay(attempt, base_seconds)
+
+
+def crawl_seed_papers_with_budget(
+    categories: List[str],
+    list_timeout: float,
+    started_at: float,
+    max_seconds: float,
+) -> List[Dict]:
+    session = requests.Session()
+    target_categories = set(categories)
+    seeds = []
+
+    for category in categories:
+        url = ARXIV_LIST_URL_TEMPLATE.format(category=category)
+        print(f"Fetching arXiv list: {url}", file=sys.stderr)
+        attempt = 1
+        while True:
+            ensure_metadata_budget(started_at, max_seconds)
+            try:
+                response = http_get_with_timeout(
+                    session,
+                    url,
+                    timeout_with_budget(list_timeout, started_at, max_seconds),
+                )
+                category_seeds = parse_list_page(response.text, target_categories)
+                print(f"Found {len(category_seeds)} candidate papers from {category}", file=sys.stderr)
+                seeds.extend(category_seeds)
+                break
+            except Exception as exc:
+                if not enhance.is_retryable_exception(exc):
+                    raise
+
+                delay = retry_delay_for_exception(attempt, 1.0, exc)
+                print(
+                    f"Retry list fetch {category} attempt {attempt} "
+                    f"after {delay:.1f}s: {enhance.short_error(exc)}",
+                    file=sys.stderr,
+                )
+                sleep_with_budget(delay, started_at, max_seconds)
+                attempt += 1
+
+    return seeds
+
+
+def metadata_from_batch(
+    session: requests.Session,
+    seeds: List[Dict],
+    timeout: float,
+    limiter: RequestLimiter,
+    started_at: float,
+    max_seconds: float,
+) -> List[Dict]:
     seed_by_id = {normalize_arxiv_id(seed["id"]): seed for seed in seeds}
     ids = list(seed_by_id.keys())
-    results = list(client.results(arxiv.Search(id_list=ids, max_results=len(ids))))
-    result_by_id = {paper_id_from_result(result): result for result in results}
+    limiter.wait(started_at, max_seconds)
+    response = http_get_with_timeout(
+        session,
+        ARXIV_API_URL,
+        timeout_with_budget(timeout, started_at, max_seconds),
+        params={
+            "search_query": "",
+            "id_list": ",".join(ids),
+            "sortBy": "relevance",
+            "sortOrder": "descending",
+            "start": 0,
+            "max_results": len(ids),
+        },
+    )
+
+    root = ET.fromstring(response.content)
+    result_by_id = {}
+    for entry in root.findall("atom:entry", ATOM_NS):
+        entry_id = normalize_arxiv_id(entry.findtext("atom:id", default="", namespaces=ATOM_NS))
+        if not entry_id:
+            continue
+
+        result_by_id[entry_id] = {
+            "id": entry_id,
+            "categories": [
+                category.attrib["term"]
+                for category in entry.findall("atom:category", ATOM_NS)
+                if category.attrib.get("term")
+            ],
+            "authors": [
+                clean_text(author.findtext("atom:name", default="", namespaces=ATOM_NS))
+                for author in entry.findall("atom:author", ATOM_NS)
+            ],
+            "title": clean_text(entry.findtext("atom:title", default="", namespaces=ATOM_NS)),
+            "comment": clean_text(entry.findtext("arxiv:comment", default="", namespaces=ATOM_NS)) or None,
+            "summary": clean_text(entry.findtext("atom:summary", default="", namespaces=ATOM_NS)),
+        }
+
     missing_ids = [paper_id for paper_id in ids if paper_id not in result_by_id]
     if missing_ids:
         raise RuntimeError(f"arXiv metadata response missing IDs: {', '.join(missing_ids)}")
@@ -137,23 +291,25 @@ def metadata_from_batch(client: arxiv.Client, seeds: List[Dict]) -> List[Dict]:
 
         enriched.append({
             "id": paper_id,
-            "categories": paper.categories,
+            "categories": paper["categories"],
             "pdf": f"https://arxiv.org/pdf/{paper_id}",
             "abs": f"https://arxiv.org/abs/{paper_id}",
-            "authors": [author.name for author in paper.authors],
-            "title": paper.title,
-            "comment": paper.comment,
-            "summary": paper.summary,
+            "authors": paper["authors"],
+            "title": paper["title"],
+            "comment": paper["comment"],
+            "summary": paper["summary"],
         })
 
     return enriched
 
 
 def resilient_metadata_batch(
-    client: arxiv.Client,
+    session: requests.Session,
     seeds: List[Dict],
     retry_attempts: int,
     retry_base_seconds: float,
+    timeout: float,
+    limiter: RequestLimiter,
     started_at: float,
     max_seconds: float,
 ) -> List[Dict]:
@@ -161,47 +317,49 @@ def resilient_metadata_batch(
     while True:
         ensure_metadata_budget(started_at, max_seconds)
         try:
-            return metadata_from_batch(client, seeds)
+            return metadata_from_batch(session, seeds, timeout, limiter, started_at, max_seconds)
         except Exception as exc:
+            if not enhance.is_retryable_exception(exc):
+                raise
+
             if len(seeds) > 1 and attempt >= retry_attempts:
-                midpoint = len(seeds) // 2
+                delay = retry_delay_for_exception(attempt, retry_base_seconds, exc)
                 print(
-                    f"Splitting metadata batch of {len(seeds)} after failure: {enhance.short_error(exc)}",
+                    f"Splitting metadata batch of {len(seeds)} after {delay:.1f}s delay: "
+                    f"{enhance.short_error(exc)}",
                     file=sys.stderr,
                 )
+                sleep_with_budget(delay, started_at, max_seconds)
+                midpoint = len(seeds) // 2
                 left_rows = resilient_metadata_batch(
-                    client,
+                    session,
                     seeds[:midpoint],
                     retry_attempts,
                     retry_base_seconds,
+                    timeout,
+                    limiter,
                     started_at,
                     max_seconds,
                 )
                 right_rows = resilient_metadata_batch(
-                    client,
+                    session,
                     seeds[midpoint:],
                     retry_attempts,
                     retry_base_seconds,
+                    timeout,
+                    limiter,
                     started_at,
                     max_seconds,
                 )
                 return left_rows + right_rows
 
-            delay = retry_delay(attempt, retry_base_seconds)
-            remaining = metadata_budget_remaining(started_at, max_seconds)
-            if remaining is not None:
-                if remaining <= 0:
-                    raise CrawlDeferred(
-                        f"arXiv metadata did not complete within {max_seconds:.0f}s; "
-                        "pending seed checkpoint was preserved for the next run"
-                    ) from exc
-                delay = min(delay, remaining)
+            delay = retry_delay_for_exception(attempt, retry_base_seconds, exc)
             target = f"paper {seeds[0]['id']}" if len(seeds) == 1 else f"batch of {len(seeds)} papers"
             print(
                 f"Retry metadata {target} attempt {attempt} after {delay:.1f}s: {enhance.short_error(exc)}",
                 file=sys.stderr,
             )
-            time.sleep(delay)
+            sleep_with_budget(delay, started_at, max_seconds)
             attempt += 1
 
 
@@ -218,6 +376,7 @@ def crawl_raw(args) -> int:
     if raw_tmp.exists():
         raw_tmp.unlink()
 
+    started_at = time.monotonic()
     history_ids = load_history_ids(output_dir, args.date, args.history_days)
     print(f"Loaded {len(history_ids)} history IDs for deduplication", file=sys.stderr)
 
@@ -226,7 +385,12 @@ def crawl_raw(args) -> int:
         print(f"Loaded pending seeds={len(unique_seeds)} from {pending_path}", file=sys.stderr)
     else:
         try:
-            seeds = crawl_seed_papers(categories, args.list_retries, args.list_timeout)
+            seeds = crawl_seed_papers_with_budget(
+                categories,
+                args.list_timeout,
+                started_at,
+                args.metadata_max_seconds,
+            )
         except Exception as exc:
             raise CrawlDeferred(
                 f"arXiv list pages are temporarily unavailable: {enhance.short_error(exc)}"
@@ -255,21 +419,19 @@ def crawl_raw(args) -> int:
         clear_pending_seeds(pending_path)
         return EXIT_NO_NEW_CONTENT
 
-    client = arxiv.Client(
-        page_size=max(args.metadata_batch_size, 1),
-        delay_seconds=args.metadata_delay_seconds,
-        num_retries=args.metadata_retries,
-    )
-
+    session = requests.Session()
+    limiter = RequestLimiter(args.metadata_delay_seconds)
     raw_rows = []
-    started_at = time.monotonic()
-    for index, batch in enumerate(batched(unique_seeds, max(args.metadata_batch_size, 1)), 1):
+    batches = list(batched(unique_seeds, max(args.metadata_batch_size, 1)))
+    for index, batch in enumerate(batches, 1):
         print(f"Fetching metadata batch {index} with {len(batch)} papers", file=sys.stderr)
         metadata_items = resilient_metadata_batch(
-            client,
+            session,
             batch,
             args.batch_retry_attempts,
             args.batch_retry_base_seconds,
+            args.metadata_timeout,
+            limiter,
             started_at,
             args.metadata_max_seconds,
         )

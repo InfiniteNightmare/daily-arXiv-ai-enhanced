@@ -51,16 +51,7 @@ jobs:
         if [ -n "$requested_date" ]; then
           today="$requested_date"
         else
-          pending_date=""
-          if [ -d data/_pending ]; then
-            pending_date=$(find data/_pending -maxdepth 1 -type f -name '*.jsonl' -printf '%f\n' | sed 's/\.jsonl$//' | sort | head -n 1)
-          fi
-          if [ -n "$pending_date" ]; then
-            today="$pending_date"
-            echo "发现待补全的历史爬取状态，优先处理 $today / Found pending crawl state; processing $today first"
-          else
-            today="$current_utc_date"
-          fi
+          today="$current_utc_date"
         fi
 
         echo "crawl_date=$today" >> "$GITHUB_OUTPUT"
