@@ -244,9 +244,9 @@ jobs:
         if [ -z "$ai_html_min_interval_seconds" ]; then ai_html_min_interval_seconds="0.5"; fi
         if [ -z "$ai_html_retry_attempts" ]; then ai_html_retry_attempts="2"; fi
         if [ -z "$ai_checkpoint_enabled" ]; then ai_checkpoint_enabled="true"; fi
-        if [ -z "$ai_checkpoint_interval_seconds" ]; then ai_checkpoint_interval_seconds="300"; fi
+        if [ -z "$ai_checkpoint_interval_seconds" ]; then ai_checkpoint_interval_seconds="600"; fi
         if ! [[ "$ai_checkpoint_interval_seconds" =~ ^[0-9]+$ ]] || [ "$ai_checkpoint_interval_seconds" -lt 30 ]; then
-          ai_checkpoint_interval_seconds="300"
+          ai_checkpoint_interval_seconds="600"
         fi
         echo "开始AI增强处理... / Starting AI enhancement processing..."
 
