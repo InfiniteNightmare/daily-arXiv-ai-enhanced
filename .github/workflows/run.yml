@@ -189,8 +189,9 @@ jobs:
       run: |
         today=${{ steps.crawl_step.outputs.crawl_date }}
         pending_file="data/_pending/${today}.jsonl"
-        if [ ! -s "$pending_file" ]; then
-          echo "没有可持久化的 pending seed 文件 / No pending seed file to persist"
+        pending_metadata_file="data/_pending/${today}.metadata.jsonl"
+        if [ ! -s "$pending_file" ] && [ ! -s "$pending_metadata_file" ]; then
+          echo "没有可持久化的 pending crawl 文件 / No pending crawl files to persist"
           exit 0
         fi
 
@@ -198,7 +199,8 @@ jobs:
         git config --global user.name "${{ vars.NAME }}"
 
         mkdir -p /tmp/crawl_state/data/_pending
-        cp "$pending_file" "/tmp/crawl_state/data/_pending/${today}.jsonl"
+        cp "$pending_file" "/tmp/crawl_state/data/_pending/${today}.jsonl" 2>/dev/null || true
+        cp "$pending_metadata_file" "/tmp/crawl_state/data/_pending/${today}.metadata.jsonl" 2>/dev/null || true
         git reset -- data assets/file-list.txt 2>/dev/null || true
         rm -rf data 2>/dev/null || true
         rm -f assets/file-list.txt 2>/dev/null || true
@@ -218,8 +220,9 @@ jobs:
         fi
 
         mkdir -p data/_pending
-        cp "/tmp/crawl_state/data/_pending/${today}.jsonl" "$pending_file"
-        git add "$pending_file"
+        cp "/tmp/crawl_state/data/_pending/${today}.jsonl" "$pending_file" 2>/dev/null || true
+        cp "/tmp/crawl_state/data/_pending/${today}.metadata.jsonl" "$pending_metadata_file" 2>/dev/null || true
+        git add "$pending_file" "$pending_metadata_file" 2>/dev/null || true
 
         if git diff --staged --quiet; then
           echo "pending 状态没有变化 / Pending state unchanged"
@@ -724,6 +727,7 @@ jobs:
         cp -r /tmp/data_files/data/* data/ 2>/dev/null || true
         cp /tmp/data_files/assets/file-list.txt assets/ 2>/dev/null || true
         rm -f "data/_pending/${today}.jsonl" 2>/dev/null || true
+        rm -f "data/_pending/${today}.metadata.jsonl" 2>/dev/null || true
         
         # 只添加数据文件 / Only add data files
         git add data/* 2>/dev/null || true

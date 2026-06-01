@@ -87,6 +87,10 @@ def pending_seed_path(output_dir: Path, target_date: str) -> Path:
     return output_dir / "_pending" / f"{target_date}.jsonl"
 
 
+def pending_metadata_path(output_dir: Path, target_date: str) -> Path:
+    return output_dir / "_pending" / f"{target_date}.metadata.jsonl"
+
+
 def read_jsonl(path: Path) -> List[Dict]:
     rows = []
     if not path.exists():
@@ -104,10 +108,33 @@ def checkpoint_pending_seeds(path: Path, seeds: List[Dict]):
     print(f"Checkpointed pending seeds={len(seeds)} at {path}", file=sys.stderr)
 
 
-def clear_pending_seeds(path: Path):
+def checkpoint_pending_metadata(path: Path, seeds: List[Dict], metadata_by_id: Dict[str, Dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        metadata_by_id[normalize_arxiv_id(seed["id"])]
+        for seed in seeds
+        if normalize_arxiv_id(seed["id"]) in metadata_by_id
+    ]
+    write_jsonl(path, rows)
+    print(f"Checkpointed pending metadata={len(rows)}/{len(seeds)} at {path}", file=sys.stderr)
+
+
+def clear_pending_file(path: Path, label: str):
     if path.exists():
         path.unlink()
-        print(f"Cleared pending seed checkpoint: {path}", file=sys.stderr)
+        print(f"Cleared pending {label} checkpoint: {path}", file=sys.stderr)
+
+
+def load_pending_metadata(path: Path, seed_ids: set) -> Dict[str, Dict]:
+    metadata_by_id = {}
+    for row in read_jsonl(path):
+        paper_id = normalize_arxiv_id(row.get("id", ""))
+        if paper_id in seed_ids and row.get("title") and row.get("summary"):
+            row["id"] = paper_id
+            metadata_by_id[paper_id] = row
+    if metadata_by_id:
+        print(f"Loaded pending metadata={len(metadata_by_id)} from {path}", file=sys.stderr)
+    return metadata_by_id
 
 
 def metadata_budget_remaining(started_at: float, max_seconds: float):
@@ -364,6 +391,7 @@ def crawl_raw(args) -> int:
     raw_path = output_dir / f"{args.date}.jsonl"
     raw_tmp = raw_path.with_suffix(raw_path.suffix + ".tmp")
     pending_path = pending_seed_path(output_dir, args.date)
+    metadata_pending_path = pending_metadata_path(output_dir, args.date)
     if raw_tmp.exists():
         raw_tmp.unlink()
 
@@ -407,13 +435,27 @@ def crawl_raw(args) -> int:
             checkpoint_pending_seeds(pending_path, unique_seeds)
 
     if not unique_seeds:
-        clear_pending_seeds(pending_path)
+        clear_pending_file(pending_path, "seed")
+        clear_pending_file(metadata_pending_path, "metadata")
         return EXIT_NO_NEW_CONTENT
+
+    seed_ids = {normalize_arxiv_id(seed["id"]) for seed in unique_seeds}
+    metadata_by_id = load_pending_metadata(metadata_pending_path, seed_ids)
+    missing_seeds = [
+        seed
+        for seed in unique_seeds
+        if normalize_arxiv_id(seed["id"]) not in metadata_by_id
+    ]
+    if metadata_by_id:
+        print(
+            f"Resuming metadata crawl: existing={len(metadata_by_id)}, "
+            f"missing={len(missing_seeds)}, total={len(unique_seeds)}",
+            file=sys.stderr,
+        )
 
     session = requests.Session()
     limiter = RequestLimiter(args.metadata_delay_seconds)
-    raw_rows = []
-    batches = list(batched(unique_seeds, max(args.metadata_batch_size, 1)))
+    batches = list(batched(missing_seeds, max(args.metadata_batch_size, 1)))
     for index, batch in enumerate(batches, 1):
         print(f"Fetching metadata batch {index} with {len(batch)} papers", file=sys.stderr)
         metadata_items = resilient_metadata_batch(
@@ -426,14 +468,23 @@ def crawl_raw(args) -> int:
             started_at,
             args.metadata_max_seconds,
         )
-        raw_rows.extend(metadata_items)
+        for item in metadata_items:
+            metadata_by_id[normalize_arxiv_id(item["id"])] = item
+        checkpoint_pending_metadata(metadata_pending_path, unique_seeds, metadata_by_id)
+
+    raw_rows = [
+        metadata_by_id[normalize_arxiv_id(seed["id"])]
+        for seed in unique_seeds
+        if normalize_arxiv_id(seed["id"]) in metadata_by_id
+    ]
 
     if len(raw_rows) != len(unique_seeds):
         raise RuntimeError(f"metadata count mismatch: expected={len(unique_seeds)} actual={len(raw_rows)}")
 
     write_jsonl(raw_tmp, raw_rows)
     raw_tmp.replace(raw_path)
-    clear_pending_seeds(pending_path)
+    clear_pending_file(pending_path, "seed")
+    clear_pending_file(metadata_pending_path, "metadata")
     print(f"Wrote raw={len(raw_rows)} metadata_complete=true", file=sys.stderr)
     return 0
 
