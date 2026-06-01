@@ -68,7 +68,7 @@ AI_RETRY_BASE_SECONDS = get_env_float("AI_RETRY_BASE_SECONDS", 2.0)
 AI_RETRY_MAX_SECONDS = get_env_float("AI_RETRY_MAX_SECONDS", 60.0)
 AI_REQUEST_TIMEOUT_SECONDS = get_env_float("AI_REQUEST_TIMEOUT_SECONDS", 120.0, min_value=1.0)
 AI_SDK_MAX_RETRIES = get_env_int("AI_SDK_MAX_RETRIES", 0, min_value=0)
-AI_CIRCUIT_BREAKER_FAILURES = get_env_int("AI_CIRCUIT_BREAKER_FAILURES", 5, min_value=1)
+AI_CIRCUIT_BREAKER_FAILURES = get_env_int("AI_CIRCUIT_BREAKER_FAILURES", 0, min_value=0)
 AI_MIN_INTERVAL_SECONDS = get_env_float("AI_MIN_INTERVAL_SECONDS", 0.0)
 AI_MAX_SECONDS = get_env_float("AI_MAX_SECONDS", 0.0)
 AI_INPUT_SOURCE = os.environ.get("AI_INPUT_SOURCE", "html").strip().lower()
@@ -77,7 +77,7 @@ AI_HTML_RETRY_ATTEMPTS = get_env_int("AI_HTML_RETRY_ATTEMPTS", 2, min_value=1)
 AI_HTML_RETRY_BASE_SECONDS = get_env_float("AI_HTML_RETRY_BASE_SECONDS", 2.0)
 AI_HTML_RETRY_MAX_SECONDS = get_env_float("AI_HTML_RETRY_MAX_SECONDS", 30.0)
 AI_HTML_MIN_INTERVAL_SECONDS = get_env_float("AI_HTML_MIN_INTERVAL_SECONDS", 0.5)
-AI_HTML_MAX_CHARS = get_env_int("AI_HTML_MAX_CHARS", 800000, min_value=1000)
+AI_HTML_MAX_CHARS = get_env_int("AI_HTML_MAX_CHARS", 0, min_value=0)
 AI_HTML_MIN_CHARS = get_env_int("AI_HTML_MIN_CHARS", 2000, min_value=0)
 
 SENSITIVE_CHECK_ENABLED = get_env_bool("SENSITIVE_CHECK_ENABLED", False)
@@ -201,7 +201,11 @@ def record_ai_failure(item_id: str, exc: Exception):
     global AI_CONSECUTIVE_FAILURES, AI_CIRCUIT_OPEN
     with STATE_LOCK:
         AI_CONSECUTIVE_FAILURES += 1
-        if not AI_CIRCUIT_OPEN and AI_CONSECUTIVE_FAILURES >= AI_CIRCUIT_BREAKER_FAILURES:
+        if (
+            AI_CIRCUIT_BREAKER_FAILURES > 0
+            and not AI_CIRCUIT_OPEN
+            and AI_CONSECUTIVE_FAILURES >= AI_CIRCUIT_BREAKER_FAILURES
+        ):
             AI_CIRCUIT_OPEN = True
             print(
                 f"AI circuit opened after {AI_CONSECUTIVE_FAILURES} consecutive failures; "
@@ -245,6 +249,8 @@ def wait_for_html_rate_limit():
 
 def truncate_for_prompt(content: str, max_chars: int) -> str:
     content = re.sub(r"\n{3,}", "\n\n", content).strip()
+    if max_chars <= 0:
+        return content
     if len(content) <= max_chars:
         return content
 
@@ -260,9 +266,10 @@ def truncate_for_prompt(content: str, max_chars: int) -> str:
 def extract_html_text(html: str) -> str:
     selector = Selector(text=html)
     for node in selector.xpath(
-        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'references') "
-        "and (contains(concat(' ', normalize-space(@class), ' '), ' ltx_bibliography ') "
-        "or self::section or self::div)]"
+        "//*[contains(concat(' ', normalize-space(@class), ' '), ' ltx_bibliography ')]"
+        " | //section[.//*[self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::h6]"
+        "[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'references') "
+        "or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'bibliography')]]"
     ):
         root = getattr(node, "root", None)
         if root is not None:
