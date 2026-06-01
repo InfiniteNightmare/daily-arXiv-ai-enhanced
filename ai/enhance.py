@@ -121,15 +121,23 @@ def progress_iter(iterable, total: int, desc: str):
     return tqdm(iterable, total=total, desc=desc)
 
 
-def log_ci_progress(processed_count: int, total_count: int, item_id: str, started_at: float):
+def log_ci_progress(
+    run_processed_count: int,
+    run_total_count: int,
+    global_processed_count: int,
+    global_total_count: int,
+    item_id: str,
+    started_at: float,
+):
     if not CI_LOGS:
         return
     elapsed = time.monotonic() - started_at
-    rate = processed_count / elapsed if elapsed > 0 else 0.0
-    remaining = total_count - processed_count
+    rate = run_processed_count / elapsed if elapsed > 0 else 0.0
+    remaining = run_total_count - run_processed_count
     eta = remaining / rate if rate > 0 else 0.0
     print(
-        f"AI progress: {processed_count}/{total_count}, remaining={remaining}, "
+        f"AI progress: run={run_processed_count}/{run_total_count}, "
+        f"total={global_processed_count}/{global_total_count}, remaining={remaining}, "
         f"last={item_id}, elapsed={format_seconds(elapsed)}, eta={format_seconds(eta)}",
         file=sys.stderr,
         flush=True,
@@ -775,7 +783,14 @@ def process_all_items(
                 processed_by_id[item_id] = apply_ai_fallback(item, "worker_error", exc=e)
             save_checkpoint(target_file, data, processed_by_id)
             processed_count += 1
-            log_ci_progress(processed_count, len(pending_data), item_id, started_at)
+            log_ci_progress(
+                processed_count,
+                len(pending_data),
+                len(processed_by_id),
+                len(data),
+                item_id,
+                started_at,
+            )
         return ordered_processed_rows(data, processed_by_id)
     
     # 使用线程池并行处理
@@ -810,7 +825,14 @@ def process_all_items(
                 processed_by_id[item_id]['AI_error'] = short_error(e)
             save_checkpoint(target_file, data, processed_by_id)
             processed_count += 1
-            log_ci_progress(processed_count, len(pending_data), item_id, started_at)
+            log_ci_progress(
+                processed_count,
+                len(pending_data),
+                len(processed_by_id),
+                len(data),
+                item_id,
+                started_at,
+            )
     
     return ordered_processed_rows(data, processed_by_id)
 
