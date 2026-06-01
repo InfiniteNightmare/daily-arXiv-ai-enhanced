@@ -18,6 +18,7 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
     - uses: actions/checkout@v4
@@ -31,48 +32,101 @@ jobs:
       run: |
         source .venv/bin/activate
         requested_date="${{ github.event.inputs.process_date }}"
-        if [ -n "$requested_date" ]; then
-          today="$requested_date"
-        else
-          today=$(date -u "+%Y-%m-%d")
-        fi
         current_utc_date=$(date -u "+%Y-%m-%d")
-        if [[ ! "$today" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-          echo "Invalid process_date: $today. Expected YYYY-MM-DD."
-          exit 1
-        fi
         categories="${{ vars.CATEGORIES }}"
         arxiv_metadata_batch_size="${{ vars.ARXIV_METADATA_BATCH_SIZE }}"
         arxiv_api_delay_seconds="${{ vars.ARXIV_API_DELAY_SECONDS }}"
         arxiv_api_num_retries="${{ vars.ARXIV_API_NUM_RETRIES }}"
+        arxiv_metadata_max_seconds="${{ vars.ARXIV_METADATA_MAX_SECONDS }}"
         if [ -z "$categories" ]; then categories="cs.CV"; fi
         if [ -z "$arxiv_metadata_batch_size" ]; then arxiv_metadata_batch_size="20"; fi
         if [ -z "$arxiv_api_delay_seconds" ]; then arxiv_api_delay_seconds="6"; fi
-        if [ -z "$arxiv_api_num_retries" ]; then arxiv_api_num_retries="6"; fi
-        echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
+        if [ -z "$arxiv_api_num_retries" ]; then arxiv_api_num_retries="0"; fi
+        if [ -z "$arxiv_metadata_max_seconds" ]; then arxiv_metadata_max_seconds="1800"; fi
 
         mkdir -p data assets
         git fetch origin +refs/heads/data:refs/remotes/origin/data || true
         git checkout origin/data -- data assets/file-list.txt 2>/dev/null || true
+
+        if [ -n "$requested_date" ]; then
+          today="$requested_date"
+        else
+          pending_date=""
+          if [ -d data/_pending ]; then
+            pending_date=$(find data/_pending -maxdepth 1 -type f -name '*.jsonl' -printf '%f\n' | sed 's/\.jsonl$//' | sort | head -n 1)
+          fi
+          if [ -n "$pending_date" ]; then
+            today="$pending_date"
+            echo "发现待补全的历史爬取状态，优先处理 $today / Found pending crawl state; processing $today first"
+          else
+            today="$current_utc_date"
+          fi
+        fi
+
+        echo "crawl_date=$today" >> "$GITHUB_OUTPUT"
+
+        if [[ ! "$today" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+          echo "Invalid process_date: $today. Expected YYYY-MM-DD."
+          exit 1
+        fi
+        echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
 
         export TOKEN_GITHUB=${{ secrets.TOKEN_GITHUB }}
         export CATEGORIES="$categories"
         export ARXIV_METADATA_BATCH_SIZE="$arxiv_metadata_batch_size"
         export ARXIV_API_DELAY_SECONDS="$arxiv_api_delay_seconds"
         export ARXIV_API_NUM_RETRIES="$arxiv_api_num_retries"
+        export ARXIV_METADATA_MAX_SECONDS="$arxiv_metadata_max_seconds"
 
         if [ -s "data/${today}.jsonl" ]; then
           echo "发现已存在的原始数据，跳过重新爬取 / Found existing raw data, skipping crawl"
+          echo "has_new_content=true" >> "$GITHUB_OUTPUT"
         else
-          if [ -n "$requested_date" ] && [ "$today" != "$current_utc_date" ]; then
+          if [ "$today" != "$current_utc_date" ] && [ ! -s "data/_pending/${today}.jsonl" ]; then
             echo "历史日期 $today 在 data 分支没有原始数据，不能用 /new 页面伪造回填 / Historical date $today has no raw data on data branch; refusing to backfill from /new"
-            exit 1
+            echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=raw_missing_for_historical_date" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           rm -f "data/${today}.jsonl"
           rm -f "data/${today}_AI_enhanced_"*.jsonl
           rm -f "data/${today}.md"
+          set +e
           python daily_arxiv/batch_crawl.py --date "$today"
+          crawl_exit_code=$?
+          set -e
+
+          echo "crawl_exit_code=$crawl_exit_code" >> "$GITHUB_OUTPUT"
+          case $crawl_exit_code in
+            0)
+              echo "has_new_content=true" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=no_new_content" >> "$GITHUB_OUTPUT"
+              echo "没有新论文需要处理 / No new papers to process"
+              exit 0
+              ;;
+            3)
+              echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+              if [ -s "data/_pending/${today}.jsonl" ]; then
+                echo "skip_reason=metadata_deferred" >> "$GITHUB_OUTPUT"
+                echo "persist_state=true" >> "$GITHUB_OUTPUT"
+                echo "metadata 尚未完整，保留 pending 状态并结束本次运行 / Metadata incomplete; pending state preserved"
+              else
+                echo "skip_reason=crawl_deferred" >> "$GITHUB_OUTPUT"
+                echo "arXiv 列表暂时不可用，本次绿色跳过 / arXiv list temporarily unavailable; skipping this run"
+              fi
+              exit 0
+              ;;
+            *)
+              echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=processing_error" >> "$GITHUB_OUTPUT"
+              echo "爬取处理异常 / Crawl processing error"
+              exit 1
+              ;;
+          esac
         fi
 
         if [ ! -s "data/${today}.jsonl" ]; then
@@ -80,11 +134,56 @@ jobs:
           exit 1
         fi
 
-        echo "crawl_date=$today" >> $GITHUB_OUTPUT
         echo "爬取完成 / Crawling completed"
+
+    - name: Persist pending crawl state
+      if: steps.crawl_step.outputs.persist_state == 'true'
+      run: |
+        today=${{ steps.crawl_step.outputs.crawl_date }}
+        pending_file="data/_pending/${today}.jsonl"
+        if [ ! -s "$pending_file" ]; then
+          echo "没有可持久化的 pending seed 文件 / No pending seed file to persist"
+          exit 0
+        fi
+
+        git config --global user.email "${{ vars.EMAIL }}"
+        git config --global user.name "${{ vars.NAME }}"
+
+        mkdir -p /tmp/crawl_state/data/_pending
+        cp "$pending_file" "/tmp/crawl_state/data/_pending/${today}.jsonl"
+        git reset -- data assets/file-list.txt 2>/dev/null || true
+        rm -rf data 2>/dev/null || true
+        rm -f assets/file-list.txt 2>/dev/null || true
+
+        if git ls-remote --heads origin data | grep -q data; then
+          git fetch origin data:data
+          git checkout data
+          git pull origin data || true
+        else
+          git checkout --orphan data
+          git rm -rf --cached . 2>/dev/null || true
+          mkdir -p data assets
+          echo "# Data Branch" > README.md
+          git add README.md
+          git commit -m "chore: initialize data branch"
+          git push origin data
+        fi
+
+        mkdir -p data/_pending
+        cp "/tmp/crawl_state/data/_pending/${today}.jsonl" "$pending_file"
+        git add "$pending_file"
+
+        if git diff --staged --quiet; then
+          echo "pending 状态没有变化 / Pending state unchanged"
+        else
+          git commit -m "chore: checkpoint pending crawl for $today"
+          git push origin data
+          echo "pending 状态已保存到 data 分支 / Pending state saved to data branch"
+        fi
 
     - name: Check for duplicates
       id: dedup_check
+      if: steps.crawl_step.outputs.has_new_content == 'true'
       run: |
         source .venv/bin/activate
         today=${{ steps.crawl_step.outputs.crawl_date }}
@@ -140,7 +239,7 @@ jobs:
         if [ -z "$ai_retry_base_seconds" ]; then ai_retry_base_seconds="10"; fi
         if [ -z "$ai_retry_max_seconds" ]; then ai_retry_max_seconds="60"; fi
         if [ -z "$ai_request_timeout_seconds" ]; then ai_request_timeout_seconds="90"; fi
-        if [ -z "$ai_circuit_breaker_failures" ]; then ai_circuit_breaker_failures="20"; fi
+        if [ -z "$ai_circuit_breaker_failures" ]; then ai_circuit_breaker_failures="5"; fi
         echo "开始AI增强处理... / Starting AI enhancement processing..."
 
         cd ai
@@ -244,7 +343,28 @@ jobs:
 
     - name: Summary
       run: |
-        if [ "${{ steps.dedup_check.outputs.has_new_content }}" = "true" ]; then
+        if [ "${{ steps.crawl_step.outputs.has_new_content }}" != "true" ]; then
+          case "${{ steps.crawl_step.outputs.skip_reason }}" in
+            "metadata_deferred")
+              echo "ℹ️ 工作流完成：metadata 尚未完整，已保存 pending 状态，后续定时运行会继续补全 / Workflow completed: Metadata incomplete; pending state saved for a later run"
+              ;;
+            "crawl_deferred")
+              echo "ℹ️ 工作流完成：arXiv 列表暂时不可用，本次未生成数据 / Workflow completed: arXiv list temporarily unavailable"
+              ;;
+            "raw_missing_for_historical_date")
+              echo "ℹ️ 工作流完成：历史日期缺少 raw/pending，跳过以避免伪造回填 / Workflow completed: Historical date has no raw/pending state, skipped"
+              ;;
+            "no_new_content")
+              echo "ℹ️ 工作流完成：没有新论文 / Workflow completed: No new papers"
+              ;;
+            "processing_error")
+              echo "⚠️ 工作流完成：爬取处理出错 / Workflow completed: Crawl processing error"
+              ;;
+            *)
+              echo "ℹ️ 工作流完成：爬取阶段跳过处理 / Workflow completed: Skipped during crawl stage"
+              ;;
+          esac
+        elif [ "${{ steps.dedup_check.outputs.has_new_content }}" = "true" ]; then
           echo "✅ 工作流完成：爬取、去重和AI增强成功处理新内容 / Workflow completed: Crawl, deduplication and AI enhancement processed new content"
         else
           case "${{ steps.dedup_check.outputs.skip_reason }}" in
@@ -359,8 +479,10 @@ jobs:
         # Before switching branches, clean untracked files that might conflict
         # 这些文件已经保存到临时目录，所以可以安全删除
         # These files are already saved to temporary directory, so safe to remove
+        git reset -- data assets/file-list.txt 2>/dev/null || true
         rm -rf data/*.jsonl 2>/dev/null || true
         rm -f data/*.md 2>/dev/null || true
+        rm -rf data/_pending 2>/dev/null || true
         rm -f assets/file-list.txt 2>/dev/null || true
         
         # 检查 data 分支是否存在 / Check if data branch exists
@@ -387,9 +509,11 @@ jobs:
         mkdir -p data assets
         cp -r /tmp/data_files/data/* data/ 2>/dev/null || true
         cp /tmp/data_files/assets/file-list.txt assets/ 2>/dev/null || true
+        rm -f "data/_pending/${today}.jsonl" 2>/dev/null || true
         
         # 只添加数据文件 / Only add data files
         git add data/* 2>/dev/null || true
+        git add -A data/_pending 2>/dev/null || true
         git add assets/file-list.txt 2>/dev/null || true
         
         # 检查是否有数据变更需要提交 / Check if there are data changes to commit
