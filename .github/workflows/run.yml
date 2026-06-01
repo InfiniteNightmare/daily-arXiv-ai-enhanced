@@ -17,6 +17,9 @@ concurrency:
   group: arxiv-daily-ai-enhanced-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   build:
 
@@ -314,6 +317,7 @@ jobs:
         export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
         export OPENAI_BASE_URL=${{ secrets.OPENAI_BASE_URL }}
         export TOKEN_GITHUB=${{ secrets.TOKEN_GITHUB }}
+        export GITHUB_TOKEN=${{ github.token }}
         export LANGUAGE="$language"
         export MODEL_NAME="$model_name"
         export AI_MAX_SECONDS="$ai_max_seconds"
@@ -338,14 +342,15 @@ jobs:
         checkpoint_dir="/tmp/ai_checkpoint_data"
 
         prepare_checkpoint_repo() {
-          if [ -z "${TOKEN_GITHUB:-}" ]; then
-            echo "跳过AI checkpoint：TOKEN_GITHUB 未配置 / Skipping AI checkpoint: TOKEN_GITHUB is not configured"
+          checkpoint_token="${TOKEN_GITHUB:-${GITHUB_TOKEN:-}}"
+          if [ -z "$checkpoint_token" ]; then
+            echo "跳过AI checkpoint：没有可用的 GitHub token / Skipping AI checkpoint: no GitHub token is available"
             return 1
           fi
 
           if [ ! -d "$checkpoint_dir/.git" ]; then
             rm -rf "$checkpoint_dir"
-            if ! git clone --depth 1 --branch data "https://x-access-token:${TOKEN_GITHUB}@github.com/${GITHUB_REPOSITORY}.git" "$checkpoint_dir" >/dev/null 2>&1; then
+            if ! git clone --depth 1 --branch data "https://x-access-token:${checkpoint_token}@github.com/${GITHUB_REPOSITORY}.git" "$checkpoint_dir" >/dev/null 2>&1; then
               echo "AI checkpoint clone failed; will retry later"
               return 1
             fi
