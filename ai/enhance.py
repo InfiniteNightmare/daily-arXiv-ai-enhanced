@@ -122,8 +122,6 @@ def progress_iter(iterable, total: int, desc: str):
 
 
 def log_ci_progress(
-    run_processed_count: int,
-    run_total_count: int,
     global_processed_count: int,
     global_total_count: int,
     item_id: str,
@@ -133,11 +131,10 @@ def log_ci_progress(
     if not CI_LOGS:
         return
     elapsed = time.monotonic() - started_at
-    remaining = run_total_count - run_processed_count
     print(
-        f"AI progress: run={run_processed_count}/{run_total_count}, "
-        f"total={global_processed_count}/{global_total_count}, remaining={remaining}, "
-        f"last={item_id}, item_time={format_seconds(item_elapsed_seconds)}, elapsed={format_seconds(elapsed)}",
+        f"AI progress: progress={global_processed_count}/{global_total_count}, "
+        f"paper={item_id}, process_time={format_seconds(item_elapsed_seconds)}, "
+        f"elapsed={format_seconds(elapsed)}",
         file=sys.stderr,
         flush=True,
     )
@@ -792,8 +789,6 @@ def process_all_items(
             save_checkpoint(target_file, data, processed_by_id)
             processed_count += 1
             log_ci_progress(
-                processed_count,
-                len(pending_data),
                 len(processed_by_id),
                 len(data),
                 item_id,
@@ -839,8 +834,6 @@ def process_all_items(
             save_checkpoint(target_file, data, processed_by_id)
             processed_count += 1
             log_ci_progress(
-                processed_count,
-                len(pending_data),
                 len(processed_by_id),
                 len(data),
                 item_id,
