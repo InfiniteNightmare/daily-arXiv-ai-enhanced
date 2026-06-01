@@ -66,7 +66,7 @@ def get_env_bool(name: str, default: bool = False) -> bool:
 AI_RETRY_ATTEMPTS = get_env_int("AI_RETRY_ATTEMPTS", 3, min_value=1)
 AI_RETRY_BASE_SECONDS = get_env_float("AI_RETRY_BASE_SECONDS", 2.0)
 AI_RETRY_MAX_SECONDS = get_env_float("AI_RETRY_MAX_SECONDS", 60.0)
-AI_REQUEST_TIMEOUT_SECONDS = get_env_float("AI_REQUEST_TIMEOUT_SECONDS", 120.0, min_value=1.0)
+AI_REQUEST_TIMEOUT_SECONDS = get_env_float("AI_REQUEST_TIMEOUT_SECONDS", 300.0, min_value=1.0)
 AI_SDK_MAX_RETRIES = get_env_int("AI_SDK_MAX_RETRIES", 0, min_value=0)
 AI_CIRCUIT_BREAKER_FAILURES = get_env_int("AI_CIRCUIT_BREAKER_FAILURES", 0, min_value=0)
 AI_MIN_INTERVAL_SECONDS = get_env_float("AI_MIN_INTERVAL_SECONDS", 0.0)
