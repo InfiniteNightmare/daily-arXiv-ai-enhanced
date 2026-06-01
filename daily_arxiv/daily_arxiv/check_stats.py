@@ -11,6 +11,7 @@
 import json
 import sys
 import os
+import argparse
 from datetime import datetime, timedelta
 
 def load_papers_data(file_path):
@@ -60,7 +61,7 @@ def save_papers_data(papers, file_path):
         print(f"Error saving {file_path}: {e}", file=sys.stderr)
         return False
 
-def perform_deduplication():
+def perform_deduplication(target_date=None):
     """
     执行多日去重：删除与历史多日重复的论文条目，保留新内容
     Perform deduplication over multiple past days
@@ -73,8 +74,10 @@ def perform_deduplication():
              - "error": 处理错误 / Processing error
     """
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_file = f"../data/{today}.jsonl"
+    if target_date is None:
+        target_date = os.environ.get("PROCESS_DATE") or datetime.utcnow().strftime("%Y-%m-%d")
+    target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+    today_file = f"../data/{target_date}.jsonl"
     history_days = 7  # 向前追溯几天的数据进行对比
 
     if not os.path.exists(today_file):
@@ -91,7 +94,7 @@ def perform_deduplication():
         # 收集历史多日 ID 集合
         history_ids = set()
         for i in range(1, history_days + 1):
-            date_str = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            date_str = (target_dt - timedelta(days=i)).strftime("%Y-%m-%d")
             history_file = f"../data/{date_str}.jsonl"
             _, past_ids = load_papers_data(history_file)
             history_ids.update(past_ids)
@@ -139,10 +142,14 @@ def main():
     2: 处理错误 / Processing error
     """
     
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", default=os.environ.get("PROCESS_DATE"))
+    args = parser.parse_args()
+
     print("正在执行去重检查... / Performing intelligent deduplication check...", file=sys.stderr)
     
     # 执行去重处理 / Perform deduplication processing
-    dedup_status = perform_deduplication()
+    dedup_status = perform_deduplication(args.date)
     
     if dedup_status == "has_new_content":
         print("✅ 去重完成，发现新内容，继续工作流 / Deduplication completed, new content found, continue workflow", file=sys.stderr)
@@ -162,4 +169,4 @@ def main():
         sys.exit(2)
 
 if __name__ == "__main__":
-    main() 
+    main()

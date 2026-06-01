@@ -69,6 +69,7 @@ AI_REQUEST_TIMEOUT_SECONDS = get_env_float("AI_REQUEST_TIMEOUT_SECONDS", 120.0, 
 AI_SDK_MAX_RETRIES = get_env_int("AI_SDK_MAX_RETRIES", 0, min_value=0)
 AI_CIRCUIT_BREAKER_FAILURES = get_env_int("AI_CIRCUIT_BREAKER_FAILURES", 5, min_value=1)
 AI_MIN_INTERVAL_SECONDS = get_env_float("AI_MIN_INTERVAL_SECONDS", 0.0)
+AI_MAX_SECONDS = get_env_float("AI_MAX_SECONDS", 0.0)
 
 SENSITIVE_CHECK_ENABLED = get_env_bool("SENSITIVE_CHECK_ENABLED", False)
 SENSITIVE_CHECK_RETRY_ATTEMPTS = get_env_int("SENSITIVE_CHECK_RETRY_ATTEMPTS", 2, min_value=1)
@@ -157,6 +158,23 @@ def build_fallback_ai_fields(item: Dict, reason: str, exc: Exception = None) -> 
     }
 
 
+def apply_ai_fallback(item: Dict, reason: str, error: str = None, exc: Exception = None) -> Dict:
+    item['AI'] = build_fallback_ai_fields(item, reason, exc)
+    item['AI_status'] = "fallback"
+    if error is not None:
+        item['AI_error'] = error
+    elif exc is not None:
+        item['AI_error'] = short_error(exc)
+    return item
+
+
+def has_metadata_fallback(item: Dict) -> bool:
+    if item.get("metadata_status") == "fallback":
+        return True
+    summary = item.get("summary") or ""
+    return summary.startswith("arXiv metadata fetch failed after retries.")
+
+
 def is_ai_circuit_open() -> bool:
     with STATE_LOCK:
         return AI_CIRCUIT_OPEN
@@ -194,6 +212,10 @@ def wait_for_ai_rate_limit():
             time.sleep(wait_seconds)
             now = time.monotonic()
         AI_LAST_REQUEST_AT = now
+
+
+def is_ai_time_budget_exceeded(started_at: float) -> bool:
+    return AI_MAX_SECONDS > 0 and (time.monotonic() - started_at) >= AI_MAX_SECONDS
 
 
 def invoke_with_retries(chain, payload: Dict, item_id: str) -> Structure:
@@ -389,10 +411,18 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
 
     fallback_ai_fields = build_fallback_ai_fields(item, "not_started")
 
-    if is_ai_circuit_open():
-        item['AI'] = build_fallback_ai_fields(item, "ai_circuit_open")
-        item['AI_status'] = "fallback"
-        item['AI_error'] = "AI enhancement skipped after repeated failures in this run."
+    if has_metadata_fallback(item):
+        apply_ai_fallback(
+            item,
+            "metadata_unavailable",
+            "AI enhancement skipped because arXiv metadata was unavailable.",
+        )
+    elif is_ai_circuit_open():
+        apply_ai_fallback(
+            item,
+            "ai_circuit_open",
+            "AI enhancement skipped after repeated failures in this run.",
+        )
     else:
         try:
             response: Structure = invoke_with_retries(chain, {
@@ -429,9 +459,7 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             record_ai_failure(item.get("id", "unknown"), e)
             # Catch any other exceptions and keep the original arXiv metadata.
             print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-            item['AI'] = build_fallback_ai_fields(item, "llm_error", e)
-            item['AI_status'] = "fallback"
-            item['AI_error'] = short_error(e)
+            apply_ai_fallback(item, "llm_error", exc=e)
     
     # Final validation to ensure all required fields exist
     for field in REQUIRED_AI_FIELDS:
@@ -449,11 +477,35 @@ def process_all_items(data: List[Dict], model_name: str, language: str, max_work
     print('Connect to:', model_name, file=sys.stderr)
     print(
         f"AI retry config: attempts={AI_RETRY_ATTEMPTS}, sdk_max_retries={AI_SDK_MAX_RETRIES}, "
-        f"base={AI_RETRY_BASE_SECONDS}s, max={AI_RETRY_MAX_SECONDS}s",
+        f"base={AI_RETRY_BASE_SECONDS}s, max={AI_RETRY_MAX_SECONDS}s, "
+        f"time_budget={AI_MAX_SECONDS}s",
         file=sys.stderr,
     )
 
     chain = build_chain(model_name)
+
+    if AI_MAX_SECONDS > 0:
+        processed_data = []
+        started_at = time.monotonic()
+        for item in tqdm(data, total=len(data), desc="Processing items"):
+            if is_ai_time_budget_exceeded(started_at):
+                processed_data.append(
+                    apply_ai_fallback(
+                        item,
+                        "time_budget_exceeded",
+                        "AI enhancement skipped because the workflow time budget was reached.",
+                    )
+                )
+                continue
+            try:
+                result = process_single_item(chain, item, language)
+                if result is None:
+                    continue
+                processed_data.append(result)
+            except Exception as e:
+                print(f"Item {item.get('id', 'unknown')} generated an exception: {e}", file=sys.stderr)
+                processed_data.append(apply_ai_fallback(item, "worker_error", exc=e))
+        return processed_data
     
     # 使用线程池并行处理
     processed_data = [None] * len(data)  # 预分配结果列表
