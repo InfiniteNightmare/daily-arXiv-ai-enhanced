@@ -64,6 +64,36 @@ Otherwise, you can directly use this repo in https://dw-dengwei.github.io/daily-
 9. You can manually click **Run workflow** to test if it works well (it may take about one hour). By default, this action will automatically run every day. You can modify it in `.github/workflows/run.yml`
 10. Set up GitHub pages: Go to your own repo -> Settings -> Pages. In `Build and deployment`, set `Source="Deploy from a branch"`, `Branch="main", "/(root)"`. Wait for a few minutes, go to https://\<username\>.github.io/daily-arXiv-ai-enhanced/. Please see this [issue](https://github.com/dw-dengwei/daily-arXiv-ai-enhanced/issues/14) for more precise instructions.
 
+## Optional workflow variables
+
+Set these in **Settings -> Secrets and variables -> Actions -> Variables**.
+
+| Variable | Default | Usage |
+| --- | --- | --- |
+| `AI_INPUT_SOURCE` | `abstract` | `abstract` sends only the arXiv metadata abstract to the LLM. `full` also fetches arXiv full text from `arxiv.org/html/{id}` at runtime and sends it in the prompt. Full text is not saved to data files. |
+| `AI_MAX_WORKERS` | `1` | Number of concurrent AI enhancement workers. Keep this at `1` for low-tier or rate-limited API plans. |
+| `AI_MIN_INTERVAL_SECONDS` | `3` | Minimum delay between AI requests across workers. Increase this if the provider returns 429. |
+| `AI_RETRY_ATTEMPTS` | `2` | Retry attempts for each AI request before preserving metadata with fallback AI fields. |
+| `AI_RETRY_BASE_SECONDS` | `10` | Base delay for exponential AI retry backoff. |
+| `AI_RETRY_MAX_SECONDS` | `60` | Maximum delay for AI retry backoff. |
+| `AI_REQUEST_TIMEOUT_SECONDS` | `300` | Per-request timeout for the AI provider. |
+| `AI_MAX_SECONDS` | `0` | AI-stage time budget. `0` means no application-level time budget. |
+| `AI_CHECKPOINT_ENABLED` | `true` | Periodically saves partial AI results to the `data` branch. |
+| `AI_CHECKPOINT_INTERVAL_SECONDS` | `600` | Checkpoint interval. The workflow also attempts one final checkpoint when it receives a termination signal. |
+| `SENSITIVE_CHECK_ENABLED` | `false` | Enables the optional sensitive-word check. Disabled by default. |
+
+When `AI_INPUT_SOURCE=full`, these additional variables control full-text fetching:
+
+| Variable | Default | Usage |
+| --- | --- | --- |
+| `AI_FULL_TEXT_MAX_CHARS` | `0` | Maximum full-text characters sent to the model. `0` means no application-level truncation. |
+| `AI_FULL_TEXT_TIMEOUT_SECONDS` | `20` | Timeout for fetching arXiv full text. |
+| `AI_FULL_TEXT_MIN_INTERVAL_SECONDS` | `0.5` | Minimum delay between arXiv full-text fetches. |
+| `AI_FULL_TEXT_RETRY_ATTEMPTS` | `2` | Retry attempts for fetching full text before falling back to abstract. |
+| `AI_FULL_TEXT_RETRY_BASE_SECONDS` | `2` | Base delay for full-text fetch retry backoff. |
+| `AI_FULL_TEXT_RETRY_MAX_SECONDS` | `30` | Maximum delay for full-text fetch retry backoff. |
+| `AI_FULL_TEXT_MIN_CHARS` | `2000` | Minimum extracted full-text length. Shorter content is treated as unavailable and falls back to abstract. |
+
 # Plans
 See https://github.com/users/dw-dengwei/projects/3
 

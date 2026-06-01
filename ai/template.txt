@@ -1,4 +1,4 @@
-Please analyze the following paper content. It may include the abstract only, or the abstract plus arXiv HTML full text when available.
+Please analyze the following paper content. It may include the abstract only, or the abstract plus arXiv full text when available.
 
 Content:
 {content}
