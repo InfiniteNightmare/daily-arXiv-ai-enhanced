@@ -63,6 +63,9 @@ def get_env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+CI_LOGS = get_env_bool("CI", False) or get_env_bool("GITHUB_ACTIONS", False)
+
+
 AI_RETRY_ATTEMPTS = get_env_int("AI_RETRY_ATTEMPTS", 3, min_value=1)
 AI_RETRY_BASE_SECONDS = get_env_float("AI_RETRY_BASE_SECONDS", 2.0)
 AI_RETRY_MAX_SECONDS = get_env_float("AI_RETRY_MAX_SECONDS", 60.0)
@@ -106,7 +109,40 @@ def short_error(exc: Exception, limit: int = 500) -> str:
 
 
 def log_status(message: str):
-    tqdm.write(message, file=sys.stderr)
+    if CI_LOGS:
+        print(message, file=sys.stderr, flush=True)
+    else:
+        tqdm.write(message, file=sys.stderr)
+
+
+def progress_iter(iterable, total: int, desc: str):
+    if CI_LOGS:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc)
+
+
+def log_ci_progress(processed_count: int, total_count: int, item_id: str, started_at: float):
+    if not CI_LOGS:
+        return
+    elapsed = time.monotonic() - started_at
+    rate = processed_count / elapsed if elapsed > 0 else 0.0
+    remaining = total_count - processed_count
+    eta = remaining / rate if rate > 0 else 0.0
+    print(
+        f"AI progress: {processed_count}/{total_count}, remaining={remaining}, "
+        f"last={item_id}, elapsed={format_seconds(elapsed)}, eta={format_seconds(eta)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def format_seconds(value: float) -> str:
+    seconds = max(int(value), 0)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    return f"{minutes}m{seconds:02d}s"
 
 
 def get_status_code(exc: Exception):
@@ -718,7 +754,8 @@ def process_all_items(
 
     if AI_MAX_SECONDS > 0:
         started_at = time.monotonic()
-        for item in tqdm(pending_data, total=len(pending_data), desc="Processing items"):
+        processed_count = 0
+        for item in progress_iter(pending_data, total=len(pending_data), desc="Processing items"):
             item_id = item.get("id", "unknown")
             if is_ai_time_budget_exceeded(started_at):
                 processed_by_id[item_id] = apply_ai_fallback(
@@ -737,9 +774,13 @@ def process_all_items(
                 print(f"Item {item.get('id', 'unknown')} generated an exception: {e}", file=sys.stderr)
                 processed_by_id[item_id] = apply_ai_fallback(item, "worker_error", exc=e)
             save_checkpoint(target_file, data, processed_by_id)
+            processed_count += 1
+            log_ci_progress(processed_count, len(pending_data), item_id, started_at)
         return ordered_processed_rows(data, processed_by_id)
     
     # 使用线程池并行处理
+    started_at = time.monotonic()
+    processed_count = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         future_to_idx = {
@@ -748,7 +789,7 @@ def process_all_items(
         }
         
         # 使用tqdm显示进度
-        for future in tqdm(
+        for future in progress_iter(
             as_completed(future_to_idx),
             total=len(pending_data),
             desc="Processing items"
@@ -768,6 +809,8 @@ def process_all_items(
                 processed_by_id[item_id]['AI_status'] = "fallback"
                 processed_by_id[item_id]['AI_error'] = short_error(e)
             save_checkpoint(target_file, data, processed_by_id)
+            processed_count += 1
+            log_ci_progress(processed_count, len(pending_data), item_id, started_at)
     
     return ordered_processed_rows(data, processed_by_id)
 
