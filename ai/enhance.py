@@ -105,6 +105,10 @@ def short_error(exc: Exception, limit: int = 500) -> str:
     return message[:limit]
 
 
+def log_status(message: str):
+    tqdm.write(message, file=sys.stderr)
+
+
 def get_status_code(exc: Exception):
     status_code = getattr(exc, "status_code", None)
     if status_code is None:
@@ -674,7 +678,7 @@ def save_checkpoint(target_file: str, ordered_data: List[Dict], processed_by_id:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
                 written += 1
     tmp_path.replace(target_path)
-    print(f"AI checkpoint saved: {written}/{len(ordered_data)} rows -> {target_file}", file=sys.stderr)
+    log_status(f"AI checkpoint saved: {written}/{len(ordered_data)} rows -> {target_path.name}")
 
 
 def ordered_processed_rows(data: List[Dict], processed_by_id: Dict) -> List[Dict]:
