@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from scrapy import Selector
 
 import dotenv
 import argparse
@@ -70,6 +71,14 @@ AI_SDK_MAX_RETRIES = get_env_int("AI_SDK_MAX_RETRIES", 0, min_value=0)
 AI_CIRCUIT_BREAKER_FAILURES = get_env_int("AI_CIRCUIT_BREAKER_FAILURES", 5, min_value=1)
 AI_MIN_INTERVAL_SECONDS = get_env_float("AI_MIN_INTERVAL_SECONDS", 0.0)
 AI_MAX_SECONDS = get_env_float("AI_MAX_SECONDS", 0.0)
+AI_INPUT_SOURCE = os.environ.get("AI_INPUT_SOURCE", "html").strip().lower()
+AI_HTML_TIMEOUT_SECONDS = get_env_float("AI_HTML_TIMEOUT_SECONDS", 20.0, min_value=1.0)
+AI_HTML_RETRY_ATTEMPTS = get_env_int("AI_HTML_RETRY_ATTEMPTS", 2, min_value=1)
+AI_HTML_RETRY_BASE_SECONDS = get_env_float("AI_HTML_RETRY_BASE_SECONDS", 2.0)
+AI_HTML_RETRY_MAX_SECONDS = get_env_float("AI_HTML_RETRY_MAX_SECONDS", 30.0)
+AI_HTML_MIN_INTERVAL_SECONDS = get_env_float("AI_HTML_MIN_INTERVAL_SECONDS", 0.5)
+AI_HTML_MAX_CHARS = get_env_int("AI_HTML_MAX_CHARS", 800000, min_value=1000)
+AI_HTML_MIN_CHARS = get_env_int("AI_HTML_MIN_CHARS", 2000, min_value=0)
 
 SENSITIVE_CHECK_ENABLED = get_env_bool("SENSITIVE_CHECK_ENABLED", False)
 SENSITIVE_CHECK_RETRY_ATTEMPTS = get_env_int("SENSITIVE_CHECK_RETRY_ATTEMPTS", 2, min_value=1)
@@ -79,9 +88,11 @@ SENSITIVE_CHECK_CIRCUIT_BREAKER_FAILURES = get_env_int("SENSITIVE_CHECK_CIRCUIT_
 
 STATE_LOCK = Lock()
 AI_RATE_LIMIT_LOCK = Lock()
+HTML_RATE_LIMIT_LOCK = Lock()
 AI_CONSECUTIVE_FAILURES = 0
 AI_CIRCUIT_OPEN = False
 AI_LAST_REQUEST_AT = 0.0
+HTML_LAST_REQUEST_AT = 0.0
 SENSITIVE_CHECK_CONSECUTIVE_FAILURES = 0
 SENSITIVE_CHECK_CIRCUIT_OPEN = False
 
@@ -216,6 +227,144 @@ def wait_for_ai_rate_limit():
 
 def is_ai_time_budget_exceeded(started_at: float) -> bool:
     return AI_MAX_SECONDS > 0 and (time.monotonic() - started_at) >= AI_MAX_SECONDS
+
+
+def wait_for_html_rate_limit():
+    global HTML_LAST_REQUEST_AT
+    if AI_HTML_MIN_INTERVAL_SECONDS <= 0:
+        return
+
+    with HTML_RATE_LIMIT_LOCK:
+        now = time.monotonic()
+        wait_seconds = HTML_LAST_REQUEST_AT + AI_HTML_MIN_INTERVAL_SECONDS - now
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+            now = time.monotonic()
+        HTML_LAST_REQUEST_AT = now
+
+
+def truncate_for_prompt(content: str, max_chars: int) -> str:
+    content = re.sub(r"\n{3,}", "\n\n", content).strip()
+    if len(content) <= max_chars:
+        return content
+
+    head_chars = int(max_chars * 0.7)
+    tail_chars = max_chars - head_chars
+    return (
+        content[:head_chars].rstrip()
+        + "\n\n[Content truncated for model context]\n\n"
+        + content[-tail_chars:].lstrip()
+    )
+
+
+def extract_html_text(html: str) -> str:
+    selector = Selector(text=html)
+    for node in selector.xpath(
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'references') "
+        "and (contains(concat(' ', normalize-space(@class), ' '), ' ltx_bibliography ') "
+        "or self::section or self::div)]"
+    ):
+        root = getattr(node, "root", None)
+        if root is not None:
+            parent = root.getparent()
+            if parent is not None:
+                parent.remove(root)
+
+    text_nodes = selector.xpath(
+        "//*[contains(concat(' ', normalize-space(@class), ' '), ' ltx_document ') "
+        "or contains(concat(' ', normalize-space(@class), ' '), ' ltx_page_content ') "
+        "or self::main or self::article]"
+        "//text()[not(ancestor::script) and not(ancestor::style) and not(ancestor::nav) "
+        "and not(ancestor::header) and not(ancestor::footer)]"
+    ).getall()
+    if not text_nodes:
+        text_nodes = selector.xpath(
+            "//body//text()[not(ancestor::script) and not(ancestor::style) "
+            "and not(ancestor::nav) and not(ancestor::header) and not(ancestor::footer)]"
+        ).getall()
+
+    lines = []
+    for node in text_nodes:
+        text = re.sub(r"\s+", " ", node).strip()
+        if text:
+            lines.append(text)
+    text = "\n".join(lines)
+    text = re.split(
+        r"\n\s*(references|bibliography)\s*\n",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return text.strip()
+
+
+def fetch_html_text(item: Dict):
+    if AI_INPUT_SOURCE not in {"html", "fulltext"}:
+        return None
+
+    paper_id = item.get("id")
+    if not paper_id:
+        return None
+
+    url = f"https://arxiv.org/html/{paper_id}"
+    last_error = None
+    for attempt in range(1, AI_HTML_RETRY_ATTEMPTS + 1):
+        try:
+            wait_for_html_rate_limit()
+            response = requests.get(url, timeout=AI_HTML_TIMEOUT_SECONDS)
+            if response.status_code == 404:
+                return None
+            if response.status_code != 200:
+                http_error = requests.HTTPError(f"HTML fetch failed with status {response.status_code}")
+                http_error.response = response
+                raise http_error
+
+            fulltext = extract_html_text(response.text)
+            if len(fulltext) < AI_HTML_MIN_CHARS:
+                raise ValueError(f"HTML text too short: {len(fulltext)} chars")
+
+            return truncate_for_prompt(fulltext, AI_HTML_MAX_CHARS)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= AI_HTML_RETRY_ATTEMPTS or not is_retryable_exception(exc):
+                print(
+                    f"HTML unavailable for {paper_id}; using abstract: {short_error(exc)}",
+                    file=sys.stderr,
+                )
+                return None
+
+            delay = retry_delay_seconds(
+                attempt,
+                AI_HTML_RETRY_BASE_SECONDS,
+                AI_HTML_RETRY_MAX_SECONDS,
+                exc,
+            )
+            print(
+                f"HTML retry {attempt}/{AI_HTML_RETRY_ATTEMPTS - 1} for {paper_id} "
+                f"after {delay:.1f}s: {short_error(exc)}",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+    print(f"HTML unavailable for {paper_id}; using abstract: {short_error(last_error)}", file=sys.stderr)
+    return None
+
+
+def build_ai_input(item: Dict) -> str:
+    abstract = item.get("summary", "")
+    html_text = fetch_html_text(item)
+    if html_text:
+        item["AI_input_source"] = "arxiv_html"
+        item["AI_input_chars"] = len(html_text)
+        return (
+            f"Title: {item.get('title', '')}\n\n"
+            f"Abstract:\n{abstract}\n\n"
+            f"Paper full text from arXiv HTML:\n{html_text}"
+        )
+
+    item["AI_input_source"] = "abstract"
+    item["AI_input_chars"] = len(abstract)
+    return abstract
 
 
 def invoke_with_retries(chain, payload: Dict, item_id: str) -> Structure:
@@ -400,12 +549,14 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
                 
         return code_info
 
-    # 检查 summary 字段
-    if is_sensitive(item.get("summary", "")):
+    ai_input = build_ai_input(item)
+
+    # 检查输入内容
+    if is_sensitive(ai_input):
         return None
 
     # 检测代码可用性
-    code_info = check_github_code(item.get("summary", ""))
+    code_info = check_github_code(ai_input)
     if code_info:
         item.update(code_info)
 
@@ -427,7 +578,7 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         try:
             response: Structure = invoke_with_retries(chain, {
                 "language": language,
-                "content": item['summary']
+                "content": ai_input
             }, item.get("id", "unknown"))
             item['AI'] = response.model_dump()
             item['AI_status'] = "ok"

@@ -18,7 +18,7 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 350
 
     steps:
     - uses: actions/checkout@v4
@@ -221,16 +221,26 @@ jobs:
         ai_retry_max_seconds="${{ vars.AI_RETRY_MAX_SECONDS }}"
         ai_request_timeout_seconds="${{ vars.AI_REQUEST_TIMEOUT_SECONDS }}"
         ai_circuit_breaker_failures="${{ vars.AI_CIRCUIT_BREAKER_FAILURES }}"
+        ai_input_source="${{ vars.AI_INPUT_SOURCE }}"
+        ai_html_max_chars="${{ vars.AI_HTML_MAX_CHARS }}"
+        ai_html_timeout_seconds="${{ vars.AI_HTML_TIMEOUT_SECONDS }}"
+        ai_html_min_interval_seconds="${{ vars.AI_HTML_MIN_INTERVAL_SECONDS }}"
+        ai_html_retry_attempts="${{ vars.AI_HTML_RETRY_ATTEMPTS }}"
         if [ -z "$language" ]; then language="Chinese"; fi
         if [ -z "$model_name" ]; then model_name="deepseek-chat"; fi
         if [ -z "$ai_max_workers" ]; then ai_max_workers="1"; fi
-        if [ -z "$ai_max_seconds" ]; then ai_max_seconds="1500"; fi
+        if [ -z "$ai_max_seconds" ]; then ai_max_seconds="0"; fi
         if [ -z "$ai_min_interval_seconds" ]; then ai_min_interval_seconds="3"; fi
         if [ -z "$ai_retry_attempts" ]; then ai_retry_attempts="2"; fi
         if [ -z "$ai_retry_base_seconds" ]; then ai_retry_base_seconds="10"; fi
         if [ -z "$ai_retry_max_seconds" ]; then ai_retry_max_seconds="60"; fi
         if [ -z "$ai_request_timeout_seconds" ]; then ai_request_timeout_seconds="90"; fi
         if [ -z "$ai_circuit_breaker_failures" ]; then ai_circuit_breaker_failures="5"; fi
+        if [ -z "$ai_input_source" ]; then ai_input_source="html"; fi
+        if [ -z "$ai_html_max_chars" ]; then ai_html_max_chars="800000"; fi
+        if [ -z "$ai_html_timeout_seconds" ]; then ai_html_timeout_seconds="20"; fi
+        if [ -z "$ai_html_min_interval_seconds" ]; then ai_html_min_interval_seconds="0.5"; fi
+        if [ -z "$ai_html_retry_attempts" ]; then ai_html_retry_attempts="2"; fi
         echo "开始AI增强处理... / Starting AI enhancement processing..."
 
         cd ai
@@ -246,6 +256,11 @@ jobs:
         export AI_RETRY_MAX_SECONDS="$ai_retry_max_seconds"
         export AI_REQUEST_TIMEOUT_SECONDS="$ai_request_timeout_seconds"
         export AI_CIRCUIT_BREAKER_FAILURES="$ai_circuit_breaker_failures"
+        export AI_INPUT_SOURCE="$ai_input_source"
+        export AI_HTML_MAX_CHARS="$ai_html_max_chars"
+        export AI_HTML_TIMEOUT_SECONDS="$ai_html_timeout_seconds"
+        export AI_HTML_MIN_INTERVAL_SECONDS="$ai_html_min_interval_seconds"
+        export AI_HTML_RETRY_ATTEMPTS="$ai_html_retry_attempts"
         export SENSITIVE_CHECK_ENABLED="${{ vars.SENSITIVE_CHECK_ENABLED }}"
 
         python enhance.py --data "../data/${today}.jsonl" --max_workers "$ai_max_workers"
