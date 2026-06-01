@@ -128,17 +128,16 @@ def log_ci_progress(
     global_total_count: int,
     item_id: str,
     started_at: float,
+    item_elapsed_seconds: float,
 ):
     if not CI_LOGS:
         return
     elapsed = time.monotonic() - started_at
-    rate = run_processed_count / elapsed if elapsed > 0 else 0.0
     remaining = run_total_count - run_processed_count
-    eta = remaining / rate if rate > 0 else 0.0
     print(
         f"AI progress: run={run_processed_count}/{run_total_count}, "
         f"total={global_processed_count}/{global_total_count}, remaining={remaining}, "
-        f"last={item_id}, elapsed={format_seconds(elapsed)}, eta={format_seconds(eta)}",
+        f"last={item_id}, item_time={format_seconds(item_elapsed_seconds)}, elapsed={format_seconds(elapsed)}",
         file=sys.stderr,
         flush=True,
     )
@@ -682,6 +681,14 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
     return item
 
 
+def process_single_item_timed(chain, item: Dict, language: str):
+    started_at = time.monotonic()
+    try:
+        return process_single_item(chain, item, language), started_at, time.monotonic(), None
+    except Exception as exc:
+        return None, started_at, time.monotonic(), exc
+
+
 def is_resumable_result(item: Dict) -> bool:
     if not item.get("id") or "AI" not in item:
         return False
@@ -764,6 +771,7 @@ def process_all_items(
         started_at = time.monotonic()
         processed_count = 0
         for item in progress_iter(pending_data, total=len(pending_data), desc="Processing items"):
+            item_started_at = time.monotonic()
             item_id = item.get("id", "unknown")
             if is_ai_time_budget_exceeded(started_at):
                 processed_by_id[item_id] = apply_ai_fallback(
@@ -790,6 +798,7 @@ def process_all_items(
                 len(data),
                 item_id,
                 started_at,
+                time.monotonic() - item_started_at,
             )
         return ordered_processed_rows(data, processed_by_id)
     
@@ -799,7 +808,7 @@ def process_all_items(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         future_to_idx = {
-            executor.submit(process_single_item, chain, item, language): idx
+            executor.submit(process_single_item_timed, chain, item, language): idx
             for idx, item in enumerate(pending_data)
         }
         
@@ -812,8 +821,12 @@ def process_all_items(
             idx = future_to_idx[future]
             source_item = pending_data[idx]
             item_id = source_item.get("id", "unknown")
+            item_started_at = time.monotonic()
+            item_finished_at = item_started_at
             try:
-                result = future.result()
+                result, item_started_at, item_finished_at, worker_error = future.result()
+                if worker_error is not None:
+                    raise worker_error
                 if result is not None:
                     processed_by_id[item_id] = result
             except Exception as e:
@@ -832,6 +845,7 @@ def process_all_items(
                 len(data),
                 item_id,
                 started_at,
+                item_finished_at - item_started_at,
             )
     
     return ordered_processed_rows(data, processed_by_id)
