@@ -5,7 +5,7 @@ name: arXiv-daily-ai-enhanced
 
 on:
   schedule:
-    - cron: "15 1 * * 1-5"
+    - cron: "15 1,7,13,19 * * 1-5"
   workflow_dispatch:
     inputs:
       process_date:
@@ -13,12 +13,15 @@ on:
         required: false
         type: string
 
+concurrency:
+  group: arxiv-daily-ai-enhanced-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
 
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 300
 
     steps:
     - uses: actions/checkout@v4
@@ -34,11 +37,13 @@ jobs:
         requested_date="${{ github.event.inputs.process_date }}"
         current_utc_date=$(date -u "+%Y-%m-%d")
         categories="${{ vars.CATEGORIES }}"
+        language="${{ vars.LANGUAGE }}"
         arxiv_metadata_batch_size="${{ vars.ARXIV_METADATA_BATCH_SIZE }}"
         arxiv_api_delay_seconds="${{ vars.ARXIV_API_DELAY_SECONDS }}"
         arxiv_api_num_retries="${{ vars.ARXIV_API_NUM_RETRIES }}"
         arxiv_metadata_max_seconds="${{ vars.ARXIV_METADATA_MAX_SECONDS }}"
         if [ -z "$categories" ]; then categories="cs.CV"; fi
+        if [ -z "$language" ]; then language="Chinese"; fi
         if [ -z "$arxiv_metadata_batch_size" ]; then arxiv_metadata_batch_size="20"; fi
         if [ -z "$arxiv_api_delay_seconds" ]; then arxiv_api_delay_seconds="0.5"; fi
         if [ -z "$arxiv_api_num_retries" ]; then arxiv_api_num_retries="0"; fi
@@ -62,6 +67,55 @@ jobs:
         fi
         echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
 
+        raw_file="data/${today}.jsonl"
+        ai_file="data/${today}_AI_enhanced_${language}.jsonl"
+        md_file="data/${today}.md"
+
+        is_day_complete() {
+          if [ ! -s "$raw_file" ] || [ ! -s "$ai_file" ] || [ ! -s "$md_file" ]; then
+            return 1
+          fi
+          python - "$raw_file" "$ai_file" <<'PY'
+        import json
+        import sys
+
+        raw_file, ai_file = sys.argv[1], sys.argv[2]
+        raw_ids = []
+        with open(raw_file, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                item_id = item.get("id")
+                if item_id and item_id not in raw_ids:
+                    raw_ids.append(item_id)
+
+        ai_ids = set()
+        with open(ai_file, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                if item.get("id") and item.get("AI"):
+                    ai_ids.add(item["id"])
+
+        missing = [item_id for item_id in raw_ids if item_id not in ai_ids]
+        if raw_ids and not missing:
+            print(f"complete: raw={len(raw_ids)} ai={len(ai_ids)}")
+            sys.exit(0)
+
+        print(f"incomplete: raw={len(raw_ids)} ai={len(ai_ids)} missing={len(missing)}")
+        sys.exit(1)
+        PY
+        }
+
+        if is_day_complete; then
+          echo "当天数据已完整，跳过本次运行 / Today's data is already complete; skipping this run"
+          echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=already_completed" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
         export TOKEN_GITHUB=${{ secrets.TOKEN_GITHUB }}
         export CATEGORIES="$categories"
         export ARXIV_METADATA_BATCH_SIZE="$arxiv_metadata_batch_size"
@@ -69,7 +123,7 @@ jobs:
         export ARXIV_API_NUM_RETRIES="$arxiv_api_num_retries"
         export ARXIV_METADATA_MAX_SECONDS="$arxiv_metadata_max_seconds"
 
-        if [ -s "data/${today}.jsonl" ]; then
+        if [ -s "$raw_file" ]; then
           echo "发现已存在的原始数据，跳过重新爬取 / Found existing raw data, skipping crawl"
           echo "has_new_content=true" >> "$GITHUB_OUTPUT"
         else
@@ -80,9 +134,9 @@ jobs:
             exit 0
           fi
 
-          rm -f "data/${today}.jsonl"
+          rm -f "$raw_file"
           rm -f "data/${today}_AI_enhanced_"*.jsonl
-          rm -f "data/${today}.md"
+          rm -f "$md_file"
           set +e
           python daily_arxiv/batch_crawl.py --date "$today"
           crawl_exit_code=$?
@@ -120,7 +174,7 @@ jobs:
           esac
         fi
 
-        if [ ! -s "data/${today}.jsonl" ]; then
+        if [ ! -s "$raw_file" ]; then
           echo "爬取失败，未生成非空数据文件 / Crawling failed, no non-empty data file generated"
           exit 1
         fi
@@ -508,6 +562,9 @@ jobs:
               ;;
             "no_new_content")
               echo "ℹ️ 工作流完成：没有新论文 / Workflow completed: No new papers"
+              ;;
+            "already_completed")
+              echo "ℹ️ 工作流完成：当天数据已完整，无需重复处理 / Workflow completed: Today's data is already complete"
               ;;
             "processing_error")
               echo "⚠️ 工作流完成：爬取处理出错 / Workflow completed: Crawl processing error"

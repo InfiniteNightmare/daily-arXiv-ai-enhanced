@@ -68,6 +68,8 @@ Otherwise, you can directly use this repo in https://dw-dengwei.github.io/daily-
 
 Set these in **Settings -> Secrets and variables -> Actions -> Variables**.
 
+The scheduled workflow runs at `01:15`, `07:15`, `13:15`, and `19:15` UTC on weekdays. Each run has a 5-hour timeout and uses checkpointed AI results on the `data` branch, so a later run can continue the same UTC day's unfinished work. If the raw data, AI-enhanced JSONL, and Markdown file for the day are already complete, the workflow exits early without reprocessing.
+
 | Variable | Default | Usage |
 | --- | --- | --- |
 | `AI_INPUT_SOURCE` | `abstract` | `abstract` sends only the arXiv metadata abstract to the LLM. `full` also fetches arXiv full text from `arxiv.org/html/{id}` at runtime and sends it in the prompt. Full text is not saved to data files. |
