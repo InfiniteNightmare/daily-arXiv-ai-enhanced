@@ -405,6 +405,7 @@ def fetch_full_text(item: Dict):
 
 
 def build_ai_input(item: Dict) -> str:
+    item["AI_requested_input_source"] = AI_INPUT_SOURCE
     abstract = item.get("summary", "")
     full_text = fetch_full_text(item)
     if full_text:
@@ -689,7 +690,7 @@ def process_single_item_timed(chain, item: Dict, language: str):
 def is_resumable_result(item: Dict) -> bool:
     if not item.get("id") or "AI" not in item:
         return False
-    if AI_INPUT_SOURCE == "full" and item.get("AI_input_source") != "full":
+    if AI_INPUT_SOURCE == "full" and item.get("AI_input_source") not in {"full", "abstract"}:
         return False
     return True
 
