@@ -238,7 +238,7 @@ jobs:
         if [ -z "$ai_retry_max_seconds" ]; then ai_retry_max_seconds="60"; fi
         if [ -z "$ai_request_timeout_seconds" ]; then ai_request_timeout_seconds="300"; fi
         if [ -z "$ai_circuit_breaker_failures" ]; then ai_circuit_breaker_failures="0"; fi
-        if [ -z "$ai_input_source" ]; then ai_input_source="html"; fi
+        if [ -z "$ai_input_source" ]; then ai_input_source="abstract"; fi
         if [ -z "$ai_html_max_chars" ]; then ai_html_max_chars="0"; fi
         if [ -z "$ai_html_timeout_seconds" ]; then ai_html_timeout_seconds="20"; fi
         if [ -z "$ai_html_min_interval_seconds" ]; then ai_html_min_interval_seconds="0.5"; fi
