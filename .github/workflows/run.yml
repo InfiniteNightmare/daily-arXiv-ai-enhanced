@@ -42,11 +42,13 @@ jobs:
           exit 1
         fi
         categories="${{ vars.CATEGORIES }}"
+        arxiv_metadata_batch_size="${{ vars.ARXIV_METADATA_BATCH_SIZE }}"
         arxiv_api_delay_seconds="${{ vars.ARXIV_API_DELAY_SECONDS }}"
         arxiv_api_num_retries="${{ vars.ARXIV_API_NUM_RETRIES }}"
         if [ -z "$categories" ]; then categories="cs.CV"; fi
-        if [ -z "$arxiv_api_delay_seconds" ]; then arxiv_api_delay_seconds="5"; fi
-        if [ -z "$arxiv_api_num_retries" ]; then arxiv_api_num_retries="12"; fi
+        if [ -z "$arxiv_metadata_batch_size" ]; then arxiv_metadata_batch_size="20"; fi
+        if [ -z "$arxiv_api_delay_seconds" ]; then arxiv_api_delay_seconds="6"; fi
+        if [ -z "$arxiv_api_num_retries" ]; then arxiv_api_num_retries="6"; fi
         echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
 
         mkdir -p data assets
@@ -55,6 +57,7 @@ jobs:
 
         export TOKEN_GITHUB=${{ secrets.TOKEN_GITHUB }}
         export CATEGORIES="$categories"
+        export ARXIV_METADATA_BATCH_SIZE="$arxiv_metadata_batch_size"
         export ARXIV_API_DELAY_SECONDS="$arxiv_api_delay_seconds"
         export ARXIV_API_NUM_RETRIES="$arxiv_api_num_retries"
 
@@ -69,9 +72,7 @@ jobs:
           rm -f "data/${today}.jsonl"
           rm -f "data/${today}_AI_enhanced_"*.jsonl
           rm -f "data/${today}.md"
-          cd daily_arxiv
-          scrapy crawl arxiv -o "../data/${today}.jsonl"
-          cd ..
+          python daily_arxiv/batch_crawl.py --date "$today"
         fi
 
         if [ ! -s "data/${today}.jsonl" ]; then
