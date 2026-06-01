@@ -630,7 +630,66 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             return None
     return item
 
-def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
+
+def is_resumable_result(item: Dict) -> bool:
+    if not item.get("id") or "AI" not in item:
+        return False
+    if AI_INPUT_SOURCE in {"html", "fulltext"} and "AI_input_source" not in item:
+        return False
+    return True
+
+
+def load_existing_results(target_file: str, raw_ids: set) -> Dict:
+    if not os.path.exists(target_file):
+        return {}
+
+    results = {}
+    with open(target_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"Skipping invalid checkpoint line: {short_error(exc)}", file=sys.stderr)
+                continue
+            item_id = item.get("id")
+            if item_id in raw_ids and is_resumable_result(item):
+                results[item_id] = item
+    return results
+
+
+def save_checkpoint(target_file: str, ordered_data: List[Dict], processed_by_id: Dict):
+    target_path = Path(target_file)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    written = 0
+    with tmp_path.open("w", encoding="utf-8") as f:
+        for source_item in ordered_data:
+            item = processed_by_id.get(source_item.get("id"))
+            if item is not None:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                written += 1
+    tmp_path.replace(target_path)
+    print(f"AI checkpoint saved: {written}/{len(ordered_data)} rows -> {target_file}", file=sys.stderr)
+
+
+def ordered_processed_rows(data: List[Dict], processed_by_id: Dict) -> List[Dict]:
+    return [
+        processed_by_id[item["id"]]
+        for item in data
+        if item.get("id") in processed_by_id
+    ]
+
+
+def process_all_items(
+    data: List[Dict],
+    model_name: str,
+    language: str,
+    max_workers: int,
+    target_file: str,
+    processed_by_id: Dict,
+) -> List[Dict]:
     """并行处理所有数据项"""
     print('Connect to:', model_name, file=sys.stderr)
     print(
@@ -641,69 +700,76 @@ def process_all_items(data: List[Dict], model_name: str, language: str, max_work
     )
 
     chain = build_chain(model_name)
+    pending_data = [item for item in data if item.get("id") not in processed_by_id]
+    print(
+        f"AI resume state: existing={len(processed_by_id)}, pending={len(pending_data)}, total={len(data)}",
+        file=sys.stderr,
+    )
+    if not pending_data:
+        save_checkpoint(target_file, data, processed_by_id)
+        return ordered_processed_rows(data, processed_by_id)
 
     if AI_MAX_SECONDS > 0:
-        processed_data = []
         started_at = time.monotonic()
-        for item in tqdm(data, total=len(data), desc="Processing items"):
+        for item in tqdm(pending_data, total=len(pending_data), desc="Processing items"):
+            item_id = item.get("id", "unknown")
             if is_ai_time_budget_exceeded(started_at):
-                processed_data.append(
-                    apply_ai_fallback(
-                        item,
-                        "time_budget_exceeded",
-                        "AI enhancement skipped because the workflow time budget was reached.",
-                    )
+                processed_by_id[item_id] = apply_ai_fallback(
+                    item,
+                    "time_budget_exceeded",
+                    "AI enhancement skipped because the workflow time budget was reached.",
                 )
+                save_checkpoint(target_file, data, processed_by_id)
                 continue
             try:
                 result = process_single_item(chain, item, language)
                 if result is None:
                     continue
-                processed_data.append(result)
+                processed_by_id[item_id] = result
             except Exception as e:
                 print(f"Item {item.get('id', 'unknown')} generated an exception: {e}", file=sys.stderr)
-                processed_data.append(apply_ai_fallback(item, "worker_error", exc=e))
-        return processed_data
+                processed_by_id[item_id] = apply_ai_fallback(item, "worker_error", exc=e)
+            save_checkpoint(target_file, data, processed_by_id)
+        return ordered_processed_rows(data, processed_by_id)
     
     # 使用线程池并行处理
-    processed_data = [None] * len(data)  # 预分配结果列表
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         future_to_idx = {
             executor.submit(process_single_item, chain, item, language): idx
-            for idx, item in enumerate(data)
+            for idx, item in enumerate(pending_data)
         }
         
         # 使用tqdm显示进度
         for future in tqdm(
             as_completed(future_to_idx),
-            total=len(data),
+            total=len(pending_data),
             desc="Processing items"
         ):
             idx = future_to_idx[future]
+            source_item = pending_data[idx]
+            item_id = source_item.get("id", "unknown")
             try:
                 result = future.result()
-                processed_data[idx] = result
+                if result is not None:
+                    processed_by_id[item_id] = result
             except Exception as e:
                 print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
                 # Keep metadata even when worker-level processing fails.
-                processed_data[idx] = data[idx]
-                processed_data[idx]['AI'] = build_fallback_ai_fields(data[idx], "worker_error", e)
-                processed_data[idx]['AI_status'] = "fallback"
-                processed_data[idx]['AI_error'] = short_error(e)
+                processed_by_id[item_id] = source_item
+                processed_by_id[item_id]['AI'] = build_fallback_ai_fields(source_item, "worker_error", e)
+                processed_by_id[item_id]['AI_status'] = "fallback"
+                processed_by_id[item_id]['AI_error'] = short_error(e)
+            save_checkpoint(target_file, data, processed_by_id)
     
-    return processed_data
+    return ordered_processed_rows(data, processed_by_id)
 
 def main():
     args = parse_args()
     model_name = os.environ.get("MODEL_NAME", 'deepseek-chat')
     language = os.environ.get("LANGUAGE", 'Chinese')
 
-    # 检查并删除目标文件
     target_file = args.data.replace('.jsonl', f'_AI_enhanced_{language}.jsonl')
-    if os.path.exists(target_file):
-        os.remove(target_file)
-        print(f'Removed existing file: {target_file}', file=sys.stderr)
 
     # 读取数据
     data = []
@@ -721,20 +787,20 @@ def main():
 
     data = unique_data
     print('Open:', args.data, file=sys.stderr)
+    existing_results = load_existing_results(target_file, seen_ids)
     
     # 并行处理所有数据
     processed_data = process_all_items(
         data,
         model_name,
         language,
-        args.max_workers
+        args.max_workers,
+        target_file,
+        existing_results,
     )
     
     # 保存结果
-    with open(target_file, "w") as f:
-        for item in processed_data:
-            if item is not None:
-                f.write(json.dumps(item) + "\n")
+    save_checkpoint(target_file, data, {item["id"]: item for item in processed_data})
 
 if __name__ == "__main__":
     main()
