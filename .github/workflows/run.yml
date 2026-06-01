@@ -40,7 +40,7 @@ jobs:
         arxiv_metadata_max_seconds="${{ vars.ARXIV_METADATA_MAX_SECONDS }}"
         if [ -z "$categories" ]; then categories="cs.CV"; fi
         if [ -z "$arxiv_metadata_batch_size" ]; then arxiv_metadata_batch_size="20"; fi
-        if [ -z "$arxiv_api_delay_seconds" ]; then arxiv_api_delay_seconds="6"; fi
+        if [ -z "$arxiv_api_delay_seconds" ]; then arxiv_api_delay_seconds="0.5"; fi
         if [ -z "$arxiv_api_num_retries" ]; then arxiv_api_num_retries="0"; fi
         if [ -z "$arxiv_metadata_max_seconds" ]; then arxiv_metadata_max_seconds="1800"; fi
 

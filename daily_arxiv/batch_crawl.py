@@ -8,9 +8,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
-import xml.etree.ElementTree as ET
 
 import requests
+from scrapy import Selector
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -31,12 +31,8 @@ from stream_crawl_enhance import (
 EXIT_NO_NEW_CONTENT = 1
 EXIT_PROCESSING_ERROR = 2
 EXIT_DEFERRED = 3
-ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_ABS_URL_TEMPLATE = "https://arxiv.org/abs/{paper_id}"
 ARXIV_LIST_URL_TEMPLATE = "https://arxiv.org/list/{category}/new"
-ATOM_NS = {
-    "atom": "http://www.w3.org/2005/Atom",
-    "arxiv": "http://arxiv.org/schemas/atom",
-}
 
 
 class CrawlDeferred(RuntimeError):
@@ -72,7 +68,7 @@ def parse_args():
     parser.add_argument("--history-days", type=int, default=7)
     parser.add_argument("--categories", default=os.environ.get("CATEGORIES", "cs.CV"))
     parser.add_argument("--metadata-batch-size", type=int, default=env_int("ARXIV_METADATA_BATCH_SIZE", 20))
-    parser.add_argument("--metadata-delay-seconds", type=float, default=env_float("ARXIV_API_DELAY_SECONDS", 6.0))
+    parser.add_argument("--metadata-delay-seconds", type=float, default=env_float("ARXIV_API_DELAY_SECONDS", 0.5))
     parser.add_argument("--metadata-retries", type=int, default=env_int("ARXIV_API_NUM_RETRIES", 0, min_value=0))
     parser.add_argument("--metadata-timeout", type=float, default=env_float("ARXIV_API_TIMEOUT_SECONDS", 30.0, min_value=0.1))
     parser.add_argument("--batch-retry-attempts", type=int, default=env_int("ARXIV_BATCH_RETRY_ATTEMPTS", 3))
@@ -173,6 +169,11 @@ def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
+def clean_descriptor_text(parts: List[str], descriptor: str) -> str:
+    text = clean_text(" ".join(parts))
+    return clean_text(re.sub(rf"^{re.escape(descriptor)}\s*", "", text, flags=re.IGNORECASE))
+
+
 def http_get_with_timeout(session: requests.Session, url: str, timeout: float, **kwargs) -> requests.Response:
     response = session.get(url, timeout=timeout, **kwargs)
     if response.status_code == 200:
@@ -232,6 +233,45 @@ def crawl_seed_papers_with_budget(
     return seeds
 
 
+def parse_abs_page_metadata(seed: Dict, html: str) -> Dict:
+    paper_id = normalize_arxiv_id(seed["id"])
+    selector = Selector(text=html)
+
+    title = clean_descriptor_text(selector.css("h1.title ::text").getall(), "Title:")
+    summary = clean_descriptor_text(selector.css("blockquote.abstract ::text").getall(), "Abstract:")
+    authors = [
+        clean_text(author)
+        for author in selector.css("div.authors a::text").getall()
+        if clean_text(author)
+    ]
+
+    comment = clean_text(
+        " ".join(selector.xpath("//td[contains(@class, 'comments')]//text()").getall())
+    ) or None
+    subjects_text = clean_text(
+        " ".join(selector.xpath("//td[contains(@class, 'subjects')]//text()").getall())
+    )
+    categories = re.findall(r"\(([^)]+)\)", subjects_text)
+    if not categories:
+        categories = seed.get("categories", [])
+
+    if not title:
+        raise RuntimeError(f"arXiv abs page missing title for {paper_id}")
+    if not summary:
+        raise RuntimeError(f"arXiv abs page missing abstract for {paper_id}")
+
+    return {
+        "id": paper_id,
+        "categories": categories,
+        "pdf": f"https://arxiv.org/pdf/{paper_id}",
+        "abs": f"https://arxiv.org/abs/{paper_id}",
+        "authors": authors,
+        "title": title,
+        "comment": comment,
+        "summary": summary,
+    }
+
+
 def metadata_from_batch(
     session: requests.Session,
     seeds: List[Dict],
@@ -240,65 +280,16 @@ def metadata_from_batch(
     started_at: float,
     max_seconds: float,
 ) -> List[Dict]:
-    seed_by_id = {normalize_arxiv_id(seed["id"]): seed for seed in seeds}
-    ids = list(seed_by_id.keys())
-    limiter.wait(started_at, max_seconds)
-    response = http_get_with_timeout(
-        session,
-        ARXIV_API_URL,
-        timeout_with_budget(timeout, started_at, max_seconds),
-        params={
-            "search_query": "",
-            "id_list": ",".join(ids),
-            "sortBy": "relevance",
-            "sortOrder": "descending",
-            "start": 0,
-            "max_results": len(ids),
-        },
-    )
-
-    root = ET.fromstring(response.content)
-    result_by_id = {}
-    for entry in root.findall("atom:entry", ATOM_NS):
-        entry_id = normalize_arxiv_id(entry.findtext("atom:id", default="", namespaces=ATOM_NS))
-        if not entry_id:
-            continue
-
-        result_by_id[entry_id] = {
-            "id": entry_id,
-            "categories": [
-                category.attrib["term"]
-                for category in entry.findall("atom:category", ATOM_NS)
-                if category.attrib.get("term")
-            ],
-            "authors": [
-                clean_text(author.findtext("atom:name", default="", namespaces=ATOM_NS))
-                for author in entry.findall("atom:author", ATOM_NS)
-            ],
-            "title": clean_text(entry.findtext("atom:title", default="", namespaces=ATOM_NS)),
-            "comment": clean_text(entry.findtext("arxiv:comment", default="", namespaces=ATOM_NS)) or None,
-            "summary": clean_text(entry.findtext("atom:summary", default="", namespaces=ATOM_NS)),
-        }
-
-    missing_ids = [paper_id for paper_id in ids if paper_id not in result_by_id]
-    if missing_ids:
-        raise RuntimeError(f"arXiv metadata response missing IDs: {', '.join(missing_ids)}")
-
     enriched = []
     for seed in seeds:
         paper_id = normalize_arxiv_id(seed["id"])
-        paper = result_by_id[paper_id]
-
-        enriched.append({
-            "id": paper_id,
-            "categories": paper["categories"],
-            "pdf": f"https://arxiv.org/pdf/{paper_id}",
-            "abs": f"https://arxiv.org/abs/{paper_id}",
-            "authors": paper["authors"],
-            "title": paper["title"],
-            "comment": paper["comment"],
-            "summary": paper["summary"],
-        })
+        limiter.wait(started_at, max_seconds)
+        response = http_get_with_timeout(
+            session,
+            ARXIV_ABS_URL_TEMPLATE.format(paper_id=paper_id),
+            timeout_with_budget(timeout, started_at, max_seconds),
+        )
+        enriched.append(parse_abs_page_metadata(seed, response.text))
 
     return enriched
 
