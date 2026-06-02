@@ -48,7 +48,11 @@ class ArxivSpider(scrapy.Spider):
             if not paper_dd:
                 continue
             
-            subjects_text = " ".join(
+            primary_subjects_text = " ".join(
+                part.strip()
+                for part in paper_dd.css(".list-subjects .primary-subject::text").getall()
+            )
+            subjects_text = primary_subjects_text or " ".join(
                 part.strip()
                 for part in paper_dd.css(".list-subjects ::text").getall()
             )
@@ -60,15 +64,11 @@ class ArxivSpider(scrapy.Spider):
                 
                 # 检查论文分类是否与目标分类有交集
                 paper_categories = set(categories_in_paper)
-                matched_categories = [
-                    category
-                    for category in self.target_categories
-                    if category in paper_categories
-                ]
-                if matched_categories:
+                primary_category = categories_in_paper[0] if categories_in_paper else None
+                if primary_category in self.target_category_set:
                     yield {
                         "id": arxiv_id,
-                        "categories": matched_categories,
+                        "categories": [primary_category],
                     }
                     self.logger.info(f"Found paper {arxiv_id} with categories {paper_categories}")
                 else:

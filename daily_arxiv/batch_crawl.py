@@ -281,7 +281,12 @@ def parse_abs_page_metadata(seed: Dict, html: str, target_categories: List[str])
     )
     categories = ordered_target_categories(seed.get("categories", []), target_categories)
     if not categories:
-        categories = ordered_target_categories(re.findall(r"\(([^)]+)\)", subjects_text), target_categories)
+        primary_subjects_text = clean_text(" ".join(selector.css(".primary-subject::text").getall()))
+        primary_categories = re.findall(r"\(([^)]+)\)", primary_subjects_text)
+        if primary_categories and primary_categories[0] in target_categories:
+            categories = [primary_categories[0]]
+        elif not primary_categories:
+            categories = ordered_target_categories(re.findall(r"\(([^)]+)\)", subjects_text), target_categories)
 
     if not title:
         raise RuntimeError(f"arXiv abs page missing title for {paper_id}")

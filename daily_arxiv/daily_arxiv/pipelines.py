@@ -26,13 +26,10 @@ class DailyArxivPipeline:
             num_retries=int(os.environ.get("ARXIV_API_NUM_RETRIES", "8")),
         )
 
-    def target_category_matches(self, categories):
-        category_set = set(categories or [])
-        return [
-            category
-            for category in self.target_categories
-            if category in category_set
-        ]
+    def target_primary_category(self, categories):
+        if categories and categories[0] in self.target_categories:
+            return [categories[0]]
+        return []
 
     def process_item(self, item: dict, spider):
         item["pdf"] = f"https://arxiv.org/pdf/{item['id']}"
@@ -45,8 +42,8 @@ class DailyArxivPipeline:
             item["authors"] = [a.name for a in paper.authors]
             item["title"] = paper.title
             item["categories"] = (
-                self.target_category_matches(item.get("categories"))
-                or self.target_category_matches(paper.categories)
+                self.target_primary_category(item.get("categories"))
+                or self.target_primary_category(paper.categories)
             )
             item["comment"] = paper.comment
             item["summary"] = paper.summary

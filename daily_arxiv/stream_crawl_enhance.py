@@ -79,11 +79,11 @@ def parse_categories(raw_categories: str) -> List[str]:
 
 
 def ordered_target_categories(categories: List[str], target_categories: List[str]) -> List[str]:
-    category_set = set(categories or [])
+    target_category_set = set(target_categories)
     seen = set()
     ordered = []
-    for category in target_categories:
-        if category in category_set and category not in seen:
+    for category in categories or []:
+        if category in target_category_set and category not in seen:
             ordered.append(category)
             seen.add(category)
     return ordered
@@ -190,6 +190,17 @@ def parse_list_page(html: str, target_categories: List[str]) -> List[Dict]:
 
         arxiv_id = normalize_arxiv_id(abstract_link)
         paper_dd = paper.xpath("following-sibling::dd[1]")
+        primary_subjects_text = " ".join(
+            part.strip()
+            for part in paper_dd.css(".list-subjects .primary-subject::text").getall()
+        )
+        primary_categories = re.findall(r"\(([^)]+)\)", primary_subjects_text)
+        if primary_categories:
+            primary_category = primary_categories[0]
+            if primary_category in target_categories:
+                papers.append({"id": arxiv_id, "categories": [primary_category]})
+            continue
+
         subjects_text = " ".join(part.strip() for part in paper_dd.css(".list-subjects ::text").getall())
         all_categories = re.findall(r"\(([^)]+)\)", subjects_text)
         matched_categories = ordered_target_categories(all_categories, target_categories)
@@ -270,8 +281,8 @@ def enrich_metadata_batch(
             continue
 
         categories = ordered_target_categories(seed.get("categories", []), target_categories)
-        if not categories:
-            categories = ordered_target_categories(paper.categories, target_categories)
+        if not categories and paper.categories and paper.categories[0] in target_categories:
+            categories = [paper.categories[0]]
 
         enriched.append({
             "id": paper_id,
