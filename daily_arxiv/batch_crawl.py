@@ -22,6 +22,7 @@ from stream_crawl_enhance import (
     enhance,
     load_history_ids,
     normalize_arxiv_id,
+    ordered_target_categories,
     parse_list_page,
     parse_categories,
     write_jsonl,
@@ -125,12 +126,13 @@ def clear_pending_file(path: Path, label: str):
         print(f"Cleared pending {label} checkpoint: {path}", file=sys.stderr)
 
 
-def load_pending_metadata(path: Path, seed_ids: set) -> Dict[str, Dict]:
+def load_pending_metadata(path: Path, seed_ids: set, target_categories: List[str]) -> Dict[str, Dict]:
     metadata_by_id = {}
     for row in read_jsonl(path):
         paper_id = normalize_arxiv_id(row.get("id", ""))
         if paper_id in seed_ids and row.get("title") and row.get("summary"):
             row["id"] = paper_id
+            row["categories"] = ordered_target_categories(row.get("categories", []), target_categories)
             metadata_by_id[paper_id] = row
     if metadata_by_id:
         print(f"Loaded pending metadata={len(metadata_by_id)} from {path}", file=sys.stderr)
@@ -225,7 +227,6 @@ def crawl_seed_papers_with_budget(
     max_seconds: float,
 ) -> List[Dict]:
     session = requests.Session()
-    target_categories = set(categories)
     seeds = []
 
     for category in categories:
@@ -240,7 +241,7 @@ def crawl_seed_papers_with_budget(
                     url,
                     timeout_with_budget(list_timeout, started_at, max_seconds),
                 )
-                category_seeds = parse_list_page(response.text, target_categories)
+                category_seeds = parse_list_page(response.text, categories)
                 print(f"Found {len(category_seeds)} candidate papers from {category}", file=sys.stderr)
                 seeds.extend(category_seeds)
                 break
@@ -260,7 +261,7 @@ def crawl_seed_papers_with_budget(
     return seeds
 
 
-def parse_abs_page_metadata(seed: Dict, html: str) -> Dict:
+def parse_abs_page_metadata(seed: Dict, html: str, target_categories: List[str]) -> Dict:
     paper_id = normalize_arxiv_id(seed["id"])
     selector = Selector(text=html)
 
@@ -278,9 +279,9 @@ def parse_abs_page_metadata(seed: Dict, html: str) -> Dict:
     subjects_text = clean_text(
         " ".join(selector.xpath("//td[contains(@class, 'subjects')]//text()").getall())
     )
-    categories = re.findall(r"\(([^)]+)\)", subjects_text)
+    categories = ordered_target_categories(seed.get("categories", []), target_categories)
     if not categories:
-        categories = seed.get("categories", [])
+        categories = ordered_target_categories(re.findall(r"\(([^)]+)\)", subjects_text), target_categories)
 
     if not title:
         raise RuntimeError(f"arXiv abs page missing title for {paper_id}")
@@ -306,6 +307,7 @@ def metadata_from_batch(
     limiter: RequestLimiter,
     started_at: float,
     max_seconds: float,
+    target_categories: List[str],
 ) -> List[Dict]:
     enriched = []
     for seed in seeds:
@@ -316,7 +318,7 @@ def metadata_from_batch(
             ARXIV_ABS_URL_TEMPLATE.format(paper_id=paper_id),
             timeout_with_budget(timeout, started_at, max_seconds),
         )
-        enriched.append(parse_abs_page_metadata(seed, response.text))
+        enriched.append(parse_abs_page_metadata(seed, response.text, target_categories))
 
     return enriched
 
@@ -330,12 +332,21 @@ def resilient_metadata_batch(
     limiter: RequestLimiter,
     started_at: float,
     max_seconds: float,
+    target_categories: List[str],
 ) -> List[Dict]:
     attempt = 1
     while True:
         ensure_metadata_budget(started_at, max_seconds)
         try:
-            return metadata_from_batch(session, seeds, timeout, limiter, started_at, max_seconds)
+            return metadata_from_batch(
+                session,
+                seeds,
+                timeout,
+                limiter,
+                started_at,
+                max_seconds,
+                target_categories,
+            )
         except Exception as exc:
             if not enhance.is_retryable_exception(exc):
                 raise
@@ -358,6 +369,7 @@ def resilient_metadata_batch(
                     limiter,
                     started_at,
                     max_seconds,
+                    target_categories,
                 )
                 right_rows = resilient_metadata_batch(
                     session,
@@ -368,6 +380,7 @@ def resilient_metadata_batch(
                     limiter,
                     started_at,
                     max_seconds,
+                    target_categories,
                 )
                 return left_rows + right_rows
 
@@ -401,6 +414,8 @@ def crawl_raw(args) -> int:
 
     if pending_path.exists():
         unique_seeds = read_jsonl(pending_path)
+        for seed in unique_seeds:
+            seed["categories"] = ordered_target_categories(seed.get("categories", []), categories)
         print(f"Loaded pending seeds={len(unique_seeds)} from {pending_path}", file=sys.stderr)
     else:
         try:
@@ -425,6 +440,7 @@ def crawl_raw(args) -> int:
                 continue
             seen_ids.add(paper_id)
             seed["id"] = paper_id
+            seed["categories"] = ordered_target_categories(seed.get("categories", []), categories)
             unique_seeds.append(seed)
 
         print(
@@ -440,7 +456,7 @@ def crawl_raw(args) -> int:
         return EXIT_NO_NEW_CONTENT
 
     seed_ids = {normalize_arxiv_id(seed["id"]) for seed in unique_seeds}
-    metadata_by_id = load_pending_metadata(metadata_pending_path, seed_ids)
+    metadata_by_id = load_pending_metadata(metadata_pending_path, seed_ids, categories)
     missing_seeds = [
         seed
         for seed in unique_seeds
@@ -467,6 +483,7 @@ def crawl_raw(args) -> int:
             limiter,
             started_at,
             args.metadata_max_seconds,
+            categories,
         )
         for item in metadata_items:
             metadata_by_id[normalize_arxiv_id(item["id"])] = item

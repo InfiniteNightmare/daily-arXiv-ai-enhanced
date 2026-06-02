@@ -78,6 +78,17 @@ def parse_categories(raw_categories: str) -> List[str]:
     return [category.strip() for category in raw_categories.split(",") if category.strip()]
 
 
+def ordered_target_categories(categories: List[str], target_categories: List[str]) -> List[str]:
+    category_set = set(categories or [])
+    seen = set()
+    ordered = []
+    for category in target_categories:
+        if category in category_set and category not in seen:
+            ordered.append(category)
+            seen.add(category)
+    return ordered
+
+
 def jsonl_rows_from_git(ref_path: str) -> Iterable[Dict]:
     try:
         proc = subprocess.run(
@@ -155,7 +166,7 @@ def fetch_text_with_retries(session: requests.Session, url: str, attempts: int, 
     raise RuntimeError(f"Failed to fetch {url} after {attempts} attempts: {last_error}")
 
 
-def parse_list_page(html: str, target_categories: set) -> List[Dict]:
+def parse_list_page(html: str, target_categories: List[str]) -> List[Dict]:
     selector = Selector(text=html)
     anchors = []
     for li in selector.css("div[id=dlpage] ul li"):
@@ -180,12 +191,11 @@ def parse_list_page(html: str, target_categories: set) -> List[Dict]:
         arxiv_id = normalize_arxiv_id(abstract_link)
         paper_dd = paper.xpath("following-sibling::dd[1]")
         subjects_text = " ".join(part.strip() for part in paper_dd.css(".list-subjects ::text").getall())
-        categories = set(re.findall(r"\(([^)]+)\)", subjects_text))
-
-        if categories:
-            if categories.intersection(target_categories):
-                papers.append({"id": arxiv_id, "categories": sorted(categories)})
-        else:
+        all_categories = re.findall(r"\(([^)]+)\)", subjects_text)
+        matched_categories = ordered_target_categories(all_categories, target_categories)
+        if matched_categories:
+            papers.append({"id": arxiv_id, "categories": matched_categories})
+        elif not all_categories:
             papers.append({"id": arxiv_id, "categories": []})
 
     return papers
@@ -193,14 +203,13 @@ def parse_list_page(html: str, target_categories: set) -> List[Dict]:
 
 def crawl_seed_papers(categories: List[str], list_retries: int, list_timeout: float) -> List[Dict]:
     session = requests.Session()
-    target_categories = set(categories)
     seeds = []
 
     for category in categories:
         url = f"https://arxiv.org/list/{category}/new"
         print(f"Fetching arXiv list: {url}", file=sys.stderr)
         html = fetch_text_with_retries(session, url, list_retries, list_timeout)
-        category_seeds = parse_list_page(html, target_categories)
+        category_seeds = parse_list_page(html, categories)
         print(f"Found {len(category_seeds)} candidate papers from {category}", file=sys.stderr)
         seeds.extend(category_seeds)
 
@@ -235,7 +244,11 @@ def fallback_metadata_item(seed: Dict, exc: Exception = None) -> Dict:
     return item
 
 
-def enrich_metadata_batch(client: arxiv.Client, seeds: List[Dict]) -> Tuple[List[Dict], int]:
+def enrich_metadata_batch(
+    client: arxiv.Client,
+    seeds: List[Dict],
+    target_categories: List[str],
+) -> Tuple[List[Dict], int]:
     seed_by_id = {normalize_arxiv_id(seed["id"]): seed for seed in seeds}
     ids = list(seed_by_id.keys())
     fallback_count = 0
@@ -256,9 +269,13 @@ def enrich_metadata_batch(client: arxiv.Client, seeds: List[Dict]) -> Tuple[List
             enriched.append(fallback_metadata_item(seed))
             continue
 
+        categories = ordered_target_categories(seed.get("categories", []), target_categories)
+        if not categories:
+            categories = ordered_target_categories(paper.categories, target_categories)
+
         enriched.append({
             "id": paper_id,
-            "categories": paper.categories,
+            "categories": categories,
             "pdf": f"https://arxiv.org/pdf/{paper_id}",
             "abs": f"https://arxiv.org/abs/{paper_id}",
             "authors": [author.name for author in paper.authors],
@@ -310,6 +327,7 @@ def stream_crawl_and_enhance(args) -> int:
             continue
         seen_ids.add(paper_id)
         seed["id"] = paper_id
+        seed["categories"] = ordered_target_categories(seed.get("categories", []), categories)
         unique_seeds.append(seed)
 
     print(
@@ -370,7 +388,7 @@ def stream_crawl_and_enhance(args) -> int:
     seq = 0
     try:
         for batch in batched(unique_seeds, args.metadata_batch_size):
-            metadata_items, fallback_count = enrich_metadata_batch(client, batch)
+            metadata_items, fallback_count = enrich_metadata_batch(client, batch, categories)
             metadata_fallback_count += fallback_count
             for item in metadata_items:
                 raw_rows.append(item)

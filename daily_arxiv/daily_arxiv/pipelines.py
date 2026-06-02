@@ -15,11 +15,24 @@ from datetime import datetime, timedelta
 class DailyArxivPipeline:
     def __init__(self):
         self.page_size = 100
+        self.target_categories = [
+            category.strip()
+            for category in os.environ.get("CATEGORIES", "cs.CV").split(",")
+            if category.strip()
+        ]
         self.client = arxiv.Client(
             page_size=self.page_size,
             delay_seconds=float(os.environ.get("ARXIV_API_DELAY_SECONDS", "3")),
             num_retries=int(os.environ.get("ARXIV_API_NUM_RETRIES", "8")),
         )
+
+    def target_category_matches(self, categories):
+        category_set = set(categories or [])
+        return [
+            category
+            for category in self.target_categories
+            if category in category_set
+        ]
 
     def process_item(self, item: dict, spider):
         item["pdf"] = f"https://arxiv.org/pdf/{item['id']}"
@@ -31,7 +44,10 @@ class DailyArxivPipeline:
             paper = next(self.client.results(search))
             item["authors"] = [a.name for a in paper.authors]
             item["title"] = paper.title
-            item["categories"] = paper.categories
+            item["categories"] = (
+                self.target_category_matches(item.get("categories"))
+                or self.target_category_matches(paper.categories)
+            )
             item["comment"] = paper.comment
             item["summary"] = paper.summary
         except Exception as exc:

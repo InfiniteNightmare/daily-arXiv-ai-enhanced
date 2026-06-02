@@ -9,7 +9,8 @@ class ArxivSpider(scrapy.Spider):
         categories = os.environ.get("CATEGORIES", "cs.CV")
         categories = categories.split(",")
         # 保存目标分类列表，用于后续验证
-        self.target_categories = set(map(str.strip, categories))
+        self.target_categories = [category.strip() for category in categories if category.strip()]
+        self.target_category_set = set(self.target_categories)
         self.start_urls = [
             f"https://arxiv.org/list/{cat}/new" for cat in self.target_categories
         ]  # 起始URL（计算机科学领域的最新论文）
@@ -47,11 +48,10 @@ class ArxivSpider(scrapy.Spider):
             if not paper_dd:
                 continue
             
-            # 提取论文分类信息 - 在subjects部分
-            subjects_text = paper_dd.css(".list-subjects .primary-subject::text").get()
-            if not subjects_text:
-                # 如果找不到主分类，尝试其他方式获取分类
-                subjects_text = paper_dd.css(".list-subjects::text").get()
+            subjects_text = " ".join(
+                part.strip()
+                for part in paper_dd.css(".list-subjects ::text").getall()
+            )
             
             if subjects_text:
                 # 解析分类信息，通常格式如 "Computer Vision and Pattern Recognition (cs.CV)"
@@ -60,14 +60,19 @@ class ArxivSpider(scrapy.Spider):
                 
                 # 检查论文分类是否与目标分类有交集
                 paper_categories = set(categories_in_paper)
-                if paper_categories.intersection(self.target_categories):
+                matched_categories = [
+                    category
+                    for category in self.target_categories
+                    if category in paper_categories
+                ]
+                if matched_categories:
                     yield {
                         "id": arxiv_id,
-                        "categories": list(paper_categories),  # 添加分类信息用于调试
+                        "categories": matched_categories,
                     }
                     self.logger.info(f"Found paper {arxiv_id} with categories {paper_categories}")
                 else:
-                    self.logger.debug(f"Skipped paper {arxiv_id} with categories {paper_categories} (not in target {self.target_categories})")
+                    self.logger.debug(f"Skipped paper {arxiv_id} with categories {paper_categories} (not in target {self.target_category_set})")
             else:
                 # 如果无法获取分类信息，记录警告但仍然返回论文（保持向后兼容）
                 self.logger.warning(f"Could not extract categories for paper {arxiv_id}, including anyway")
