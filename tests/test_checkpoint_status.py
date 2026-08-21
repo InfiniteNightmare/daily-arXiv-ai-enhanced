@@ -6,13 +6,12 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
 AI_DIR = ROOT_DIR / "ai"
 if str(AI_DIR) not in sys.path:
     sys.path.insert(0, str(AI_DIR))
 
-import checkpoint_status  # noqa: E402
+import checkpoint_status
 
 
 def write_jsonl(path, rows):
@@ -33,7 +32,7 @@ def ai_fields(details="AI enhancement unavailable"):
 
 
 class CheckDayTests(unittest.TestCase):
-    def check_single_result(self, ai_result):
+    def check_single_result(self, ai_result, input_source="abstract"):
         with TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)
             raw_path = directory / "2026-08-21.jsonl"
@@ -43,7 +42,7 @@ class CheckDayTests(unittest.TestCase):
 
             output = io.StringIO()
             with redirect_stdout(output):
-                result = checkpoint_status.check_day(raw_path, ai_path)
+                result = checkpoint_status.check_day(raw_path, ai_path, input_source)
             return result, output.getvalue()
 
     def test_check_day_rejects_legacy_402_fallback(self):
@@ -67,7 +66,7 @@ class CheckDayTests(unittest.TestCase):
         self.assertIn("incomplete:", output)
         self.assertIn("deferred=1", output)
 
-    def test_check_day_accepts_ordinary_422_fallback(self):
+    def test_check_day_rejects_ordinary_422_fallback(self):
         result, output = self.check_single_result(
             {
                 "id": "2608.12345",
@@ -81,8 +80,98 @@ class CheckDayTests(unittest.TestCase):
             }
         )
 
+        self.assertFalse(result)
+        self.assertIn("incomplete:", output)
+        self.assertIn("deferred=1", output)
+
+    def test_check_day_accepts_only_complete_ok_or_legacy_success(self):
+        complete_ok = {
+            "id": "2608.12345",
+            "AI": ai_fields("generated"),
+            "AI_status": "ok",
+        }
+        result, output = self.check_single_result(complete_ok)
         self.assertTrue(result)
         self.assertIn("complete:", output)
+
+        legacy_task_success = {
+            "id": "2608.12345",
+            "AI": {
+                "task": "legacy generated summary",
+                "motivation": "generated",
+                "method": "generated",
+                "result": "generated",
+                "conclusion": "generated",
+            },
+        }
+        result, output = self.check_single_result(legacy_task_success, input_source="full")
+        self.assertTrue(result)
+        self.assertIn("complete:", output)
+
+    def test_check_day_matches_full_input_resume_rule(self):
+        explicit_ok_without_source = {
+            "id": "2608.12345",
+            "AI": ai_fields("generated"),
+            "AI_status": "ok",
+        }
+
+        result, output = self.check_single_result(
+            explicit_ok_without_source,
+            input_source="full",
+        )
+
+        self.assertFalse(result)
+        self.assertIn("deferred=1", output)
+
+        legacy_success = {
+            "id": "2608.12345",
+            "AI": ai_fields("legacy generated result"),
+        }
+        result, output = self.check_single_result(legacy_success)
+        self.assertTrue(result)
+        self.assertIn("complete:", output)
+
+    def test_check_day_rejects_partial_unknown_and_incomplete_results(self):
+        cases = {
+            "partial": {
+                "id": "2608.12345",
+                "AI": ai_fields("partial result"),
+                "AI_status": "partial",
+            },
+            "unknown": {
+                "id": "2608.12345",
+                "AI": ai_fields("unknown result"),
+                "AI_status": "unknown",
+            },
+            "incomplete_ok": {
+                "id": "2608.12345",
+                "AI": {**ai_fields("generated"), "result": ""},
+                "AI_status": "ok",
+            },
+        }
+
+        for name, item in cases.items():
+            with self.subTest(name=name):
+                result, output = self.check_single_result(item)
+                self.assertFalse(result)
+                self.assertIn("deferred=1", output)
+
+    def test_check_day_rejects_legacy_placeholder_failure(self):
+        result, output = self.check_single_result(
+            {
+                "id": "2608.12345",
+                "AI": {
+                    "tldr": "Summary generation failed",
+                    "motivation": "Motivation analysis unavailable",
+                    "method": "Method extraction failed",
+                    "result": "Result analysis unavailable",
+                    "conclusion": "Conclusion extraction failed",
+                },
+            }
+        )
+
+        self.assertFalse(result)
+        self.assertIn("deferred=1", output)
 
 
 if __name__ == "__main__":

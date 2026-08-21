@@ -368,6 +368,12 @@ def stream_crawl_and_enhance(args) -> int:
                     return
                 seq, item = task
                 processed = enhance.process_single_item(chain, item, args.language)
+                if processed is None:
+                    processed = enhance.apply_ai_fallback(
+                        item,
+                        "empty_worker_result",
+                        "AI enhancement deferred because the worker returned no result.",
+                    )
                 with results_lock:
                     results.append((seq, processed))
             except Exception as exc:
@@ -377,7 +383,6 @@ def stream_crawl_and_enhance(args) -> int:
                     item,
                     "stream_worker_error",
                     exc=exc,
-                    deferred=True,
                 )
                 with results_lock:
                     results.append((seq, item))

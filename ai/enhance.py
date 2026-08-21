@@ -25,7 +25,7 @@ from langchain.prompts import (
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
 )
-from checkpoint_status import is_resumable_ai_result
+from checkpoint_status import has_complete_ai_fields, is_resumable_ai_result
 from structure import Structure
 
 AI_DIR = Path(__file__).resolve().parent
@@ -341,10 +341,9 @@ def apply_ai_fallback(
     reason: str,
     error: str = None,
     exc: Exception = None,
-    deferred: bool = False,
 ) -> Dict:
     item['AI'] = build_fallback_ai_fields(item, reason, exc)
-    item['AI_status'] = "deferred" if deferred else "fallback"
+    item['AI_status'] = "deferred"
     item['AI_failure_reason'] = reason
     if error is not None:
         item['AI_error'] = error
@@ -759,14 +758,17 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             item,
             "ai_circuit_open",
             "AI enhancement deferred after an account-wide or repeated failure in this run.",
-            deferred=True,
         )
 
     ai_input = build_ai_input(item)
 
     # 检查输入内容
     if is_sensitive(ai_input):
-        return None
+        return apply_ai_fallback(
+            item,
+            "sensitive_input",
+            "AI enhancement deferred because the input was rejected by the content check.",
+        )
 
     # 检测代码可用性
     code_info = check_github_code(ai_input)
@@ -779,10 +781,19 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             "content": ai_input
         }, item.get("id", "unknown"))
         item['AI'] = response.model_dump()
-        item['AI_status'] = "ok"
-        item.pop('AI_error', None)
-        item.pop('AI_failure_reason', None)
-        record_ai_success()
+        if has_complete_ai_fields(item):
+            item['AI_status'] = "ok"
+            item.pop('AI_error', None)
+            item.pop('AI_failure_reason', None)
+            record_ai_success()
+        else:
+            incomplete_error = ValueError("AI returned an incomplete structured response")
+            record_ai_failure(item.get("id", "unknown"), incomplete_error)
+            apply_ai_fallback(
+                item,
+                "incomplete_output",
+                "AI enhancement deferred because the structured response was incomplete.",
+            )
     except langchain_core.exceptions.OutputParserException as e:
         record_ai_failure(item.get("id", "unknown"), e)
         # 尝试从错误信息中提取 JSON 字符串并修复
@@ -802,7 +813,7 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
 
         # Merge partial data with fallback data to ensure metadata is preserved.
         item['AI'] = {**build_fallback_ai_fields(item, "output_parser_error", e), **partial_data}
-        item['AI_status'] = "partial" if partial_data else "deferred"
+        item['AI_status'] = "deferred"
         item['AI_failure_reason'] = "output_parser_error"
         item['AI_error'] = short_error(e)
         print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
@@ -815,7 +826,6 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             item,
             "provider_account_error" if terminal_error else "llm_error",
             exc=e,
-            deferred=terminal_error or is_retryable_exception(e),
         )
     
     # Final validation to ensure all required fields exist
@@ -826,7 +836,11 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
     # 检查 AI 生成的所有字段
     for v in item.get("AI", {}).values():
         if is_sensitive(str(v)):
-            return None
+            return apply_ai_fallback(
+                item,
+                "sensitive_output",
+                "AI enhancement deferred because the generated output was rejected by the content check.",
+            )
     return item
 
 
@@ -911,7 +925,6 @@ def process_all_items(
         file=sys.stderr,
     )
 
-    chain = build_chain(model_name)
     if checkpoint_by_id is None:
         checkpoint_by_id = dict(processed_by_id)
     pending_data = [item for item in data if item.get("id") not in processed_by_id]
@@ -920,6 +933,17 @@ def process_all_items(
         file=sys.stderr,
     )
     if not pending_data:
+        save_checkpoint(target_file, data, checkpoint_by_id)
+        return ordered_processed_rows(data, checkpoint_by_id)
+
+    try:
+        chain = build_chain(model_name)
+    except Exception as exc:
+        print(f"AI client initialization failed; deferring all pending items: {short_error(exc)}", file=sys.stderr)
+        for item in pending_data:
+            item_id = item.get("id", "unknown")
+            result = apply_ai_fallback(item, "client_initialization_error", exc=exc)
+            checkpoint_by_id[item_id] = result
         save_checkpoint(target_file, data, checkpoint_by_id)
         return ordered_processed_rows(data, checkpoint_by_id)
 
@@ -934,7 +958,6 @@ def process_all_items(
                     item,
                     "time_budget_exceeded",
                     "AI enhancement skipped because the workflow time budget was reached.",
-                    deferred=True,
                 )
                 processed_by_id[item_id] = result
                 checkpoint_by_id[item_id] = result
@@ -943,7 +966,11 @@ def process_all_items(
             try:
                 result = process_single_item(chain, item, language)
                 if result is None:
-                    continue
+                    result = apply_ai_fallback(
+                        item,
+                        "empty_worker_result",
+                        "AI enhancement deferred because the worker returned no result.",
+                    )
                 processed_by_id[item_id] = result
                 checkpoint_by_id[item_id] = result
             except Exception as e:
@@ -952,7 +979,6 @@ def process_all_items(
                     item,
                     "worker_error",
                     exc=e,
-                    deferred=True,
                 )
                 processed_by_id[item_id] = result
                 checkpoint_by_id[item_id] = result
@@ -992,9 +1018,14 @@ def process_all_items(
                 result, item_started_at, item_finished_at, worker_error = future.result()
                 if worker_error is not None:
                     raise worker_error
-                if result is not None:
-                    processed_by_id[item_id] = result
-                    checkpoint_by_id[item_id] = result
+                if result is None:
+                    result = apply_ai_fallback(
+                        source_item,
+                        "empty_worker_result",
+                        "AI enhancement deferred because the worker returned no result.",
+                    )
+                processed_by_id[item_id] = result
+                checkpoint_by_id[item_id] = result
             except Exception as e:
                 print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
                 # Keep metadata even when worker-level processing fails.
@@ -1002,7 +1033,6 @@ def process_all_items(
                     source_item,
                     "worker_error",
                     exc=e,
-                    deferred=True,
                 )
                 processed_by_id[item_id] = result
                 checkpoint_by_id[item_id] = result

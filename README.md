@@ -73,14 +73,14 @@ Otherwise, you can watch the video above first and directly use this repo in htt
 
 Set these in **Settings -> Secrets and variables -> Actions -> Variables**.
 
-The scheduled workflow runs at `02:15`, `08:15`, `14:15`, and `20:15` UTC on weekdays. Each run has a 5-hour timeout and uses checkpointed crawl metadata and AI results on the `data` branch, so a later run can continue the same UTC day's unfinished work. Results deferred by account-wide provider errors (for example, exhausted balance) are retried by the next scheduled run for that UTC date, while completed papers are preserved. If the raw data, AI-enhanced JSONL, and Markdown file for the day are already complete, the workflow exits early without reprocessing. Historical dates can be resumed manually with the `process_date` workflow input.
+The scheduled workflow runs at `02:15`, `08:15`, `14:15`, and `20:15` UTC on weekdays. Each run has a 5-hour timeout and uses checkpointed crawl metadata and AI results on the `data` branch, so a later run can continue the same UTC day's unfinished work. Any AI result that is not a complete structured success is deferred and retried by the next scheduled run for that UTC date, while completed papers are preserved. If the raw data, AI-enhanced JSONL, and Markdown file for the day are already complete, the workflow exits early without reprocessing. Historical dates can be resumed manually with the `process_date` workflow input.
 
 | Variable | Default | Usage |
 | --- | --- | --- |
 | `AI_INPUT_SOURCE` | `abstract` | `abstract` sends only the arXiv metadata abstract to the LLM. `full` also fetches arXiv full text from `arxiv.org/html/{id}` at runtime and sends it in the prompt. Full text is not saved to data files. |
 | `AI_MAX_WORKERS` | `1` | Number of concurrent AI enhancement workers. Keep this at `1` for low-tier or rate-limited API plans. |
 | `AI_MIN_INTERVAL_SECONDS` | `3` | Minimum delay between AI requests across workers. Increase this if the provider returns 429. |
-| `AI_RETRY_ATTEMPTS` | `2` | Retry attempts for each AI request before preserving metadata with fallback AI fields. |
+| `AI_RETRY_ATTEMPTS` | `2` | Retry attempts for each AI request before preserving metadata as a deferred result for the next same-day run. |
 | `AI_RETRY_BASE_SECONDS` | `10` | Base delay for exponential AI retry backoff. |
 | `AI_RETRY_MAX_SECONDS` | `60` | Maximum delay for AI retry backoff. |
 | `AI_REQUEST_TIMEOUT_SECONDS` | `300` | Per-request timeout for the AI provider. |

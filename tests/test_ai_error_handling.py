@@ -50,6 +50,24 @@ class FakeChain:
         raise AssertionError("The fake chain was not expected to be invoked")
 
 
+class FakeStructuredResponse:
+    def __init__(self, fields=None):
+        self.fields = fields or complete_ai_fields()
+
+    def model_dump(self):
+        return dict(self.fields)
+
+
+class SuccessfulChain:
+    def __init__(self, fields=None):
+        self.response = FakeStructuredResponse(fields)
+        self.calls = []
+
+    def invoke(self, payload):
+        self.calls.append(payload)
+        return self.response
+
+
 def minimax_balance_error():
     body = {
         "type": "error",
@@ -277,6 +295,17 @@ class RetryPolicyTests(EnhanceStateTestCase):
 
 
 class SingleItemFailureFlowTests(EnhanceStateTestCase):
+    def test_metadata_fallback_is_deferred_without_calling_llm(self):
+        item = sample_item()
+        item["metadata_status"] = "fallback"
+        chain = FakeChain()
+
+        processed = enhance.process_single_item(chain, item, "Chinese")
+
+        self.assertEqual(chain.calls, [])
+        self.assertEqual(processed["AI_status"], "deferred")
+        self.assertEqual(processed["AI_failure_reason"], "metadata_unavailable")
+
     def test_open_circuit_skips_input_build_full_text_and_llm(self):
         original = sample_item()
         item = copy.deepcopy(original)
@@ -325,7 +354,7 @@ class SingleItemFailureFlowTests(EnhanceStateTestCase):
         self.assert_metadata_preserved(original, processed)
         self.assertEqual(set(enhance.REQUIRED_AI_FIELDS) - set(processed["AI"]), set())
 
-    def test_ordinary_422_falls_back_without_opening_circuit(self):
+    def test_ordinary_422_defers_without_opening_circuit(self):
         original = sample_item()
         item = copy.deepcopy(original)
         chain = FakeChain(ordinary_422_error())
@@ -340,9 +369,67 @@ class SingleItemFailureFlowTests(EnhanceStateTestCase):
         self.assertEqual(len(chain.calls), 1)
         sleep.assert_not_called()
         self.assertFalse(enhance.is_ai_circuit_open())
-        self.assertEqual(processed["AI_status"], "fallback")
+        self.assertEqual(processed["AI_status"], "deferred")
         self.assert_metadata_preserved(original, processed)
         self.assertEqual(set(enhance.REQUIRED_AI_FIELDS) - set(processed["AI"]), set())
+
+    def test_partial_parser_output_is_deferred(self):
+        item = sample_item()
+        error = enhance.langchain_core.exceptions.OutputParserException(
+            'Function Structure arguments: {"tldr": "partial summary"} are not valid JSON'
+        )
+        chain = FakeChain(error)
+        enhance.AI_RETRY_ATTEMPTS = 1
+
+        with (
+            mock.patch.object(enhance, "build_ai_input", return_value=item["summary"]),
+            mock.patch.object(enhance, "is_sensitive", return_value=False),
+        ):
+            processed = enhance.process_single_item(chain, item, "Chinese")
+
+        self.assertEqual(processed["AI_status"], "deferred")
+        self.assertEqual(processed["AI_failure_reason"], "output_parser_error")
+        self.assertEqual(processed["AI"]["tldr"], "partial summary")
+
+    def test_sensitive_input_and_output_are_deferred(self):
+        input_item = sample_item()
+        input_chain = FakeChain()
+        with (
+            mock.patch.object(enhance, "build_ai_input", return_value=input_item["summary"]),
+            mock.patch.object(enhance, "is_sensitive", return_value=True),
+        ):
+            input_result = enhance.process_single_item(input_chain, input_item, "Chinese")
+
+        self.assertEqual(input_chain.calls, [])
+        self.assertEqual(input_result["AI_status"], "deferred")
+        self.assertEqual(input_result["AI_failure_reason"], "sensitive_input")
+
+        output_item = sample_item()
+        output_chain = SuccessfulChain()
+        with (
+            mock.patch.object(enhance, "build_ai_input", return_value=output_item["summary"]),
+            mock.patch.object(enhance, "is_sensitive", side_effect=[False, True]),
+        ):
+            output_result = enhance.process_single_item(output_chain, output_item, "Chinese")
+
+        self.assertEqual(len(output_chain.calls), 1)
+        self.assertEqual(output_result["AI_status"], "deferred")
+        self.assertEqual(output_result["AI_failure_reason"], "sensitive_output")
+
+    def test_incomplete_structured_response_is_deferred(self):
+        item = sample_item()
+        incomplete_fields = complete_ai_fields()
+        incomplete_fields["result"] = ""
+        chain = SuccessfulChain(incomplete_fields)
+
+        with (
+            mock.patch.object(enhance, "build_ai_input", return_value=item["summary"]),
+            mock.patch.object(enhance, "is_sensitive", return_value=False),
+        ):
+            processed = enhance.process_single_item(chain, item, "Chinese")
+
+        self.assertEqual(processed["AI_status"], "deferred")
+        self.assertEqual(processed["AI_failure_reason"], "incomplete_output")
 
     def test_first_402_defers_three_sequential_items_with_only_one_llm_call(self):
         items = []
@@ -402,17 +489,84 @@ class ResumableResultTests(EnhanceStateTestCase):
         self.assertFalse(enhance.is_resumable_result(deferred))
         self.assertFalse(enhance.is_resumable_result(legacy_402))
 
-    def test_ok_partial_and_ordinary_422_fallback_are_resumable(self):
+    def test_only_complete_ok_result_is_resumable(self):
         ok = self.result("ok")
         partial = self.result("partial", "structured output was incomplete")
         ordinary_fallback = self.result(
             "fallback",
             "Error code: 422 - {'error': {'type': 'unprocessable_entity_error'}}",
         )
+        unknown = self.result("unknown")
 
         self.assertTrue(enhance.is_resumable_result(ok))
-        self.assertTrue(enhance.is_resumable_result(partial))
-        self.assertTrue(enhance.is_resumable_result(ordinary_fallback))
+        self.assertFalse(enhance.is_resumable_result(partial))
+        self.assertFalse(enhance.is_resumable_result(ordinary_fallback))
+        self.assertFalse(enhance.is_resumable_result(unknown))
+
+    def test_legacy_success_without_status_remains_resumable(self):
+        legacy_success = {
+            "id": "2608.12345",
+            "AI": complete_ai_fields(),
+            "AI_input_source": "abstract",
+        }
+        legacy_failure = {
+            **legacy_success,
+            "AI": complete_ai_fields("AI enhancement unavailable (llm_error)."),
+        }
+
+        self.assertTrue(enhance.is_resumable_result(legacy_success))
+        self.assertFalse(enhance.is_resumable_result(legacy_failure))
+
+    def test_legacy_task_schema_without_status_remains_resumable(self):
+        legacy_success = {
+            "id": "2608.12345",
+            "AI": {
+                "task": "legacy generated summary",
+                "motivation": "generated",
+                "method": "generated",
+                "result": "generated",
+                "conclusion": "generated",
+            },
+        }
+
+        with mock.patch.object(enhance, "AI_INPUT_SOURCE", "full"):
+            self.assertTrue(enhance.is_resumable_result(legacy_success))
+
+    def test_explicit_ok_without_input_source_is_retried_in_full_mode(self):
+        explicit_ok = self.result("ok")
+        explicit_ok.pop("AI_input_source")
+
+        with mock.patch.object(enhance, "AI_INPUT_SOURCE", "full"):
+            self.assertFalse(enhance.is_resumable_result(explicit_ok))
+
+    def test_legacy_placeholder_failures_without_status_are_not_resumable(self):
+        legacy_default_failure = {
+            "id": "2608.12345",
+            "AI": {
+                "tldr": "Summary generation failed",
+                "motivation": "Motivation analysis unavailable",
+                "method": "Method extraction failed",
+                "result": "Result analysis unavailable",
+                "conclusion": "Conclusion extraction failed",
+            },
+            "AI_input_source": "abstract",
+        }
+        legacy_worker_failure = {
+            "id": "2608.12346",
+            "AI": {field: "Processing failed" for field in enhance.REQUIRED_AI_FIELDS},
+            "AI_input_source": "abstract",
+        }
+
+        self.assertFalse(enhance.is_resumable_result(legacy_default_failure))
+        self.assertFalse(enhance.is_resumable_result(legacy_worker_failure))
+
+    def test_ok_result_with_incomplete_fields_or_stale_error_is_not_resumable(self):
+        incomplete = self.result("ok")
+        incomplete["AI"]["conclusion"] = ""
+        stale_error = self.result("ok", "old provider error")
+
+        self.assertFalse(enhance.is_resumable_result(incomplete))
+        self.assertFalse(enhance.is_resumable_result(stale_error))
 
 
 if __name__ == "__main__":

@@ -6,13 +6,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
 AI_DIR = ROOT_DIR / "ai"
 if str(AI_DIR) not in sys.path:
     sys.path.insert(0, str(AI_DIR))
 
-import enhance  # noqa: E402
+import enhance
 
 
 def ai_fields(details):
@@ -33,7 +32,7 @@ def write_jsonl(path, rows):
 
 
 class CheckpointPreservationTests(unittest.TestCase):
-    def test_interrupt_preserves_unprocessed_deferred_checkpoint_rows(self):
+    def test_interrupt_preserves_unprocessed_non_success_checkpoint_rows(self):
         source_rows = [
             {"id": "paper-ok", "title": "Already complete", "summary": "one"},
             {"id": "paper-retry-1", "title": "First retry", "summary": "two"},
@@ -45,18 +44,18 @@ class CheckpointPreservationTests(unittest.TestCase):
             "AI_status": "ok",
             "AI_input_source": "abstract",
         }
-        first_deferred = {
+        first_non_success = {
             **source_rows[1],
             "AI": ai_fields("temporarily unavailable"),
-            "AI_status": "deferred",
-            "AI_error": "Error code: 402 - insufficient_balance_error",
+            "AI_status": "fallback",
+            "AI_error": "Error code: 422 - unprocessable_entity_error",
             "AI_input_source": "abstract",
         }
-        second_deferred = {
+        second_non_success = {
             **source_rows[2],
-            "AI": ai_fields("temporarily unavailable"),
-            "AI_status": "deferred",
-            "AI_error": "AI enhancement deferred because the circuit is open.",
+            "AI": ai_fields("partially generated"),
+            "AI_status": "partial",
+            "AI_error": "Structured output was incomplete.",
             "AI_input_source": "abstract",
         }
 
@@ -64,7 +63,7 @@ class CheckpointPreservationTests(unittest.TestCase):
             checkpoint_path = Path(temp_dir) / "enhanced.jsonl"
             write_jsonl(
                 checkpoint_path,
-                [existing_ok, first_deferred, second_deferred],
+                [existing_ok, first_non_success, second_non_success],
             )
             raw_ids = {row["id"] for row in source_rows}
 
@@ -120,17 +119,17 @@ class CheckpointPreservationTests(unittest.TestCase):
                     "is_ai_time_budget_exceeded",
                     return_value=False,
                 ),
+                self.assertRaises(KeyboardInterrupt),
             ):
-                with self.assertRaises(KeyboardInterrupt):
-                    enhance.process_all_items(
-                        source_rows,
-                        "test-model",
-                        "Chinese",
-                        1,
-                        str(checkpoint_path),
-                        processed_by_id,
-                        checkpoint_by_id,
-                    )
+                enhance.process_all_items(
+                    source_rows,
+                    "test-model",
+                    "Chinese",
+                    1,
+                    str(checkpoint_path),
+                    processed_by_id,
+                    checkpoint_by_id,
+                )
 
             build_chain.assert_called_once_with("test-model")
             self.assertEqual(processed_calls, ["paper-retry-1", "paper-retry-2"])
@@ -150,7 +149,50 @@ class CheckpointPreservationTests(unittest.TestCase):
                 written_by_id["paper-retry-1"]["AI"],
                 ai_fields("new success"),
             )
-            self.assertEqual(written_by_id["paper-retry-2"], second_deferred)
+            self.assertEqual(written_by_id["paper-retry-2"], second_non_success)
+
+    def test_client_initialization_failure_defers_every_pending_row(self):
+        source_rows = [
+            {"id": "paper-ok", "title": "Already complete", "summary": "one"},
+            {"id": "paper-pending-1", "title": "Pending one", "summary": "two"},
+            {"id": "paper-pending-2", "title": "Pending two", "summary": "three"},
+        ]
+        existing_ok = {
+            **source_rows[0],
+            "AI": ai_fields("existing success"),
+            "AI_status": "ok",
+            "AI_input_source": "abstract",
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "enhanced.jsonl"
+            checkpoint_by_id = {"paper-ok": existing_ok}
+            processed_by_id = {"paper-ok": existing_ok}
+
+            with mock.patch.object(
+                enhance,
+                "build_chain",
+                side_effect=RuntimeError("client configuration unavailable"),
+            ):
+                results = enhance.process_all_items(
+                    source_rows,
+                    "test-model",
+                    "Chinese",
+                    1,
+                    str(checkpoint_path),
+                    processed_by_id,
+                    checkpoint_by_id,
+                )
+
+            results_by_id = {item["id"]: item for item in results}
+            self.assertEqual(set(results_by_id), {row["id"] for row in source_rows})
+            self.assertEqual(results_by_id["paper-ok"], existing_ok)
+            for item_id in ("paper-pending-1", "paper-pending-2"):
+                self.assertEqual(results_by_id[item_id]["AI_status"], "deferred")
+                self.assertEqual(
+                    results_by_id[item_id]["AI_failure_reason"],
+                    "client_initialization_error",
+                )
 
 
 if __name__ == "__main__":

@@ -1,69 +1,91 @@
 import argparse
 import json
-import re
+import os
 import sys
 from pathlib import Path
 
-RETRYABLE_HTTP_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 522, 524}
-RUN_TERMINAL_HTTP_STATUS_CODES = {401, 402}
-LEGACY_TERMINAL_ERROR_MARKERS = (
-    "billing_hard_limit_reached",
-    "credit_balance_exhausted",
-    "insufficient_balance",
-    "insufficient_quota",
-    "token plan usage limit",
-    "token plan 用量上限",
+REQUIRED_AI_FIELDS = ("tldr", "motivation", "method", "result", "conclusion")
+LEGACY_FAILURE_MARKERS = (
+    "ai enhancement unavailable",
+    "ai enhancement failed after retries",
+    "original arxiv metadata is preserved",
 )
-LEGACY_DEFERRED_REASONS = (
-    "ai_circuit_open",
-    "stream_worker_error",
-    "time_budget_exceeded",
-    "worker_error",
-)
-STATUS_CODE_PATTERN = re.compile(
-    r"(?:error\s+code|status(?:\s+code)?|status_code|http_code)[\"'\s:=]+(\d{3})",
-    re.IGNORECASE,
-)
+LEGACY_FAILURE_FIELD_VALUES = {
+    "tldr": "summary generation failed",
+    "motivation": "motivation analysis unavailable",
+    "method": "method extraction failed",
+    "result": "result analysis unavailable",
+    "conclusion": "conclusion extraction failed",
+}
 
 
-def has_metadata_fallback(item: dict) -> bool:
-    if item.get("metadata_status") == "fallback":
-        return True
-    summary = item.get("summary") or ""
-    return summary.startswith("arXiv metadata fetch failed after retries.")
+def has_complete_ai_fields(item: dict) -> bool:
+    ai_fields = item.get("AI")
+    if not isinstance(ai_fields, dict):
+        return False
+    return all(
+        isinstance(ai_fields.get(field), str) and ai_fields[field].strip()
+        for field in REQUIRED_AI_FIELDS
+    )
 
 
-def status_code_from_text(error_text: str):
-    match = STATUS_CODE_PATTERN.search(error_text)
-    return int(match.group(1)) if match else None
+def has_complete_legacy_ai_fields(item: dict) -> bool:
+    ai_fields = item.get("AI")
+    if not isinstance(ai_fields, dict):
+        return False
+    summary = ai_fields.get("tldr") or ai_fields.get("task")
+    return (
+        isinstance(summary, str)
+        and bool(summary.strip())
+        and all(
+            isinstance(ai_fields.get(field), str) and ai_fields[field].strip()
+            for field in REQUIRED_AI_FIELDS
+            if field != "tldr"
+        )
+    )
 
 
-def is_legacy_deferred_result(item: dict) -> bool:
-    if item.get("AI_status") != "fallback" or has_metadata_fallback(item):
+def is_legacy_success(item: dict) -> bool:
+    if item.get("AI_error") or item.get("AI_failure_reason"):
+        return False
+    ai_fields = item.get("AI", {})
+    normalized_fields = {
+        field: str(
+            (ai_fields.get("tldr") or ai_fields.get("task"))
+            if field == "tldr"
+            else (ai_fields.get(field) or "")
+        )
+        .strip()
+        .lower()
+        for field in REQUIRED_AI_FIELDS
+    }
+    if any(
+        normalized_fields[field] == failure_value
+        for field, failure_value in LEGACY_FAILURE_FIELD_VALUES.items()
+    ):
+        return False
+    if all(value == "processing failed" for value in normalized_fields.values()):
         return False
 
-    error_text = str(item.get("AI_error") or "").lower()
-    if any(marker in error_text for marker in LEGACY_TERMINAL_ERROR_MARKERS):
-        return True
-
-    status_code = status_code_from_text(error_text)
-    if status_code in RUN_TERMINAL_HTTP_STATUS_CODES or status_code in RETRYABLE_HTTP_STATUS_CODES:
-        return True
-    if status_code is not None and status_code >= 500:
-        return True
-
-    ai_details = json.dumps(item.get("AI", {}), ensure_ascii=False).lower()
-    return any(f"({reason})" in ai_details for reason in LEGACY_DEFERRED_REASONS)
+    ai_details = json.dumps(ai_fields, ensure_ascii=False).lower()
+    return not any(marker in ai_details for marker in LEGACY_FAILURE_MARKERS)
 
 
 def needs_ai_retry(item: dict) -> bool:
-    return item.get("AI_status") == "deferred" or is_legacy_deferred_result(item)
+    status = item.get("AI_status")
+    if status is None:
+        return not has_complete_legacy_ai_fields(item) or not is_legacy_success(item)
+    return (
+        status != "ok"
+        or not has_complete_ai_fields(item)
+        or bool(item.get("AI_error") or item.get("AI_failure_reason"))
+    )
 
 
 def is_resumable_ai_result(item: dict, input_source: str) -> bool:
-    if not item.get("id") or "AI" not in item or needs_ai_retry(item):
+    if not item.get("id") or needs_ai_retry(item):
         return False
-    if item.get("AI_status") == "fallback":
+    if item.get("AI_status") is None:
         return True
     return not (
         input_source == "full"
@@ -78,7 +100,7 @@ def read_jsonl(path: Path):
                 yield json.loads(line)
 
 
-def check_day(raw_path: Path, ai_path: Path) -> bool:
+def check_day(raw_path: Path, ai_path: Path, input_source: str = "abstract") -> bool:
     raw_ids = []
     for item in read_jsonl(raw_path):
         item_id = item.get("id")
@@ -89,9 +111,9 @@ def check_day(raw_path: Path, ai_path: Path) -> bool:
     deferred_ids = set()
     for item in read_jsonl(ai_path):
         item_id = item.get("id")
-        if not item_id or not item.get("AI"):
+        if not item_id:
             continue
-        if needs_ai_retry(item):
+        if not is_resumable_ai_result(item, input_source):
             deferred_ids.add(item_id)
         else:
             completed_ids.add(item_id)
@@ -116,12 +138,17 @@ def parse_args():
     check_parser = subparsers.add_parser("check-day")
     check_parser.add_argument("raw_path", type=Path)
     check_parser.add_argument("ai_path", type=Path)
+    check_parser.add_argument(
+        "--input-source",
+        choices=("abstract", "full"),
+        default=os.environ.get("AI_INPUT_SOURCE", "abstract"),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    return 0 if check_day(args.raw_path, args.ai_path) else 1
+    return 0 if check_day(args.raw_path, args.ai_path, args.input_source) else 1
 
 
 if __name__ == "__main__":
