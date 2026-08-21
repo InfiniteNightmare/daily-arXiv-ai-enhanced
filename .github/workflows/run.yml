@@ -78,38 +78,7 @@ jobs:
           if [ ! -s "$raw_file" ] || [ ! -s "$ai_file" ] || [ ! -s "$md_file" ]; then
             return 1
           fi
-          python - "$raw_file" "$ai_file" <<'PY'
-        import json
-        import sys
-
-        raw_file, ai_file = sys.argv[1], sys.argv[2]
-        raw_ids = []
-        with open(raw_file, encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                item = json.loads(line)
-                item_id = item.get("id")
-                if item_id and item_id not in raw_ids:
-                    raw_ids.append(item_id)
-
-        ai_ids = set()
-        with open(ai_file, encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                item = json.loads(line)
-                if item.get("id") and item.get("AI"):
-                    ai_ids.add(item["id"])
-
-        missing = [item_id for item_id in raw_ids if item_id not in ai_ids]
-        if raw_ids and not missing:
-            print(f"complete: raw={len(raw_ids)} ai={len(ai_ids)}")
-            sys.exit(0)
-
-        print(f"incomplete: raw={len(raw_ids)} ai={len(ai_ids)} missing={len(missing)}")
-        sys.exit(1)
-        PY
+          python ai/checkpoint_status.py check-day "$raw_file" "$ai_file"
         }
 
         if is_day_complete; then
@@ -300,7 +269,7 @@ jobs:
         if [ -z "$ai_retry_base_seconds" ]; then ai_retry_base_seconds="10"; fi
         if [ -z "$ai_retry_max_seconds" ]; then ai_retry_max_seconds="60"; fi
         if [ -z "$ai_request_timeout_seconds" ]; then ai_request_timeout_seconds="300"; fi
-        if [ -z "$ai_circuit_breaker_failures" ]; then ai_circuit_breaker_failures="0"; fi
+        if [ -z "$ai_circuit_breaker_failures" ]; then ai_circuit_breaker_failures="5"; fi
         if [ -z "$ai_input_source" ]; then ai_input_source="abstract"; fi
         if [ -z "$ai_full_text_max_chars" ]; then ai_full_text_max_chars="0"; fi
         if [ -z "$ai_full_text_timeout_seconds" ]; then ai_full_text_timeout_seconds="20"; fi

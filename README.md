@@ -73,7 +73,7 @@ Otherwise, you can watch the video above first and directly use this repo in htt
 
 Set these in **Settings -> Secrets and variables -> Actions -> Variables**.
 
-The scheduled workflow runs at `02:15`, `08:15`, `14:15`, and `20:15` UTC on weekdays. Each run has a 5-hour timeout and uses checkpointed crawl metadata and AI results on the `data` branch, so a later run can continue the same UTC day's unfinished work. If the raw data, AI-enhanced JSONL, and Markdown file for the day are already complete, the workflow exits early without reprocessing.
+The scheduled workflow runs at `02:15`, `08:15`, `14:15`, and `20:15` UTC on weekdays. Each run has a 5-hour timeout and uses checkpointed crawl metadata and AI results on the `data` branch, so a later run can continue the same UTC day's unfinished work. Results deferred by account-wide provider errors (for example, exhausted balance) are retried by the next scheduled run for that UTC date, while completed papers are preserved. If the raw data, AI-enhanced JSONL, and Markdown file for the day are already complete, the workflow exits early without reprocessing. Historical dates can be resumed manually with the `process_date` workflow input.
 
 | Variable | Default | Usage |
 | --- | --- | --- |
@@ -84,6 +84,7 @@ The scheduled workflow runs at `02:15`, `08:15`, `14:15`, and `20:15` UTC on wee
 | `AI_RETRY_BASE_SECONDS` | `10` | Base delay for exponential AI retry backoff. |
 | `AI_RETRY_MAX_SECONDS` | `60` | Maximum delay for AI retry backoff. |
 | `AI_REQUEST_TIMEOUT_SECONDS` | `300` | Per-request timeout for the AI provider. |
+| `AI_CIRCUIT_BREAKER_FAILURES` | `5` | Stops further AI calls after this many consecutive retryable failures. Account-wide authentication or balance errors stop calls immediately. Set to `0` to disable only the consecutive-failure threshold. |
 | `AI_MAX_SECONDS` | `0` | AI-stage time budget. `0` means no application-level time budget. |
 | `AI_CHECKPOINT_ENABLED` | `true` | Periodically saves partial AI results to the `data` branch. |
 | `AI_CHECKPOINT_INTERVAL_SECONDS` | `600` | Checkpoint interval. The workflow also attempts one final checkpoint when it receives a termination signal. |

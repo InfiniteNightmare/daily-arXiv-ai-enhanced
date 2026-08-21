@@ -25,6 +25,7 @@ from langchain.prompts import (
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
 )
+from checkpoint_status import is_resumable_ai_result
 from structure import Structure
 
 AI_DIR = Path(__file__).resolve().parent
@@ -34,6 +35,31 @@ template = (AI_DIR / "template.txt").read_text()
 system = (AI_DIR / "system.txt").read_text()
 
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 522, 524}
+RUN_TERMINAL_HTTP_STATUS_CODES = {401, 402}
+RUN_TERMINAL_ERROR_IDENTIFIERS = {
+    "account_deactivated",
+    "authentication_error",
+    "billing_error",
+    "billing_hard_limit_reached",
+    "credit_balance_exhausted",
+    "enforced_spend_limit_reached",
+    "insufficient_balance",
+    "insufficient_balance_error",
+    "insufficient_quota",
+    "invalid_api_key",
+    "organization_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+    "permission_denied_error",
+    "project_spend_limit_exceeded",
+}
+RUN_TERMINAL_ERROR_TEXT_MARKERS = (
+    "token plan usage limit",
+    "token plan 用量上限",
+)
+STATUS_CODE_PATTERN = re.compile(
+    r"(?:error\s+code|status(?:\s+code)?|status_code|http_code)[\"'\s:=]+(\d{3})",
+    re.IGNORECASE,
+)
 REQUIRED_AI_FIELDS = ["tldr", "motivation", "method", "result", "conclusion"]
 SENSITIVE_CHECK_URL = os.environ.get("SENSITIVE_CHECK_URL", "https://spam.dw-dengwei.workers.dev")
 
@@ -71,7 +97,7 @@ AI_RETRY_BASE_SECONDS = get_env_float("AI_RETRY_BASE_SECONDS", 2.0)
 AI_RETRY_MAX_SECONDS = get_env_float("AI_RETRY_MAX_SECONDS", 60.0)
 AI_REQUEST_TIMEOUT_SECONDS = get_env_float("AI_REQUEST_TIMEOUT_SECONDS", 300.0, min_value=1.0)
 AI_SDK_MAX_RETRIES = get_env_int("AI_SDK_MAX_RETRIES", 0, min_value=0)
-AI_CIRCUIT_BREAKER_FAILURES = get_env_int("AI_CIRCUIT_BREAKER_FAILURES", 0, min_value=0)
+AI_CIRCUIT_BREAKER_FAILURES = get_env_int("AI_CIRCUIT_BREAKER_FAILURES", 5, min_value=0)
 AI_MIN_INTERVAL_SECONDS = get_env_float("AI_MIN_INTERVAL_SECONDS", 0.0)
 AI_MAX_SECONDS = get_env_float("AI_MAX_SECONDS", 0.0)
 AI_INPUT_SOURCE = os.environ.get("AI_INPUT_SOURCE", "abstract").strip().lower()
@@ -149,19 +175,113 @@ def format_seconds(value: float) -> str:
     return f"{minutes}m{seconds:02d}s"
 
 
-def get_status_code(exc: Exception):
-    status_code = getattr(exc, "status_code", None)
-    if status_code is None:
-        response = getattr(exc, "response", None)
-        status_code = getattr(response, "status_code", None)
-
+def as_status_code(value):
     try:
-        return int(status_code) if status_code is not None else None
+        status_code = int(value)
     except (TypeError, ValueError):
         return None
+    return status_code if 100 <= status_code <= 599 else None
+
+
+def iter_exception_chain(exc: Exception):
+    pending = [exc]
+    seen = set()
+    while pending:
+        current = pending.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.extend((getattr(current, "__cause__", None), getattr(current, "__context__", None)))
+
+
+def find_status_code_in_payload(payload):
+    if isinstance(payload, dict):
+        for key in ("status_code", "http_code", "status"):
+            status_code = as_status_code(payload.get(key))
+            if status_code is not None:
+                return status_code
+        for value in payload.values():
+            status_code = find_status_code_in_payload(value)
+            if status_code is not None:
+                return status_code
+    elif isinstance(payload, (list, tuple)):
+        for value in payload:
+            status_code = find_status_code_in_payload(value)
+            if status_code is not None:
+                return status_code
+    elif isinstance(payload, str):
+        match = STATUS_CODE_PATTERN.search(payload)
+        if match:
+            return as_status_code(match.group(1))
+    return None
+
+
+def response_error_payload(response):
+    if response is None:
+        return None
+    try:
+        return response.json()
+    except Exception:
+        return getattr(response, "text", None)
+
+
+def get_status_code(exc: Exception):
+    for current in iter_exception_chain(exc):
+        for source in (current, getattr(current, "response", None)):
+            if source is None:
+                continue
+            for name in ("status_code", "status"):
+                status_code = as_status_code(getattr(source, name, None))
+                if status_code is not None:
+                    return status_code
+
+        for payload in (
+            getattr(current, "body", None),
+            getattr(current, "error", None),
+            getattr(current, "details", None),
+            response_error_payload(getattr(current, "response", None)),
+            str(current),
+        ):
+            status_code = find_status_code_in_payload(payload)
+            if status_code is not None:
+                return status_code
+    return None
+
+
+def normalized_error_text(exc: Exception) -> str:
+    parts = []
+    for current in iter_exception_chain(exc):
+        parts.append(str(current))
+        for payload in (
+            getattr(current, "body", None),
+            getattr(current, "error", None),
+            getattr(current, "details", None),
+            response_error_payload(getattr(current, "response", None)),
+        ):
+            if payload is None:
+                continue
+            try:
+                parts.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            except (TypeError, ValueError):
+                parts.append(str(payload))
+    return " ".join(parts).lower()
+
+
+def is_run_terminal_ai_exception(exc: Exception) -> bool:
+    if get_status_code(exc) in RUN_TERMINAL_HTTP_STATUS_CODES:
+        return True
+
+    error_text = normalized_error_text(exc)
+    identifier_text = re.sub(r"[^a-z0-9]+", "_", error_text)
+    if any(identifier in identifier_text for identifier in RUN_TERMINAL_ERROR_IDENTIFIERS):
+        return True
+    return any(marker in error_text for marker in RUN_TERMINAL_ERROR_TEXT_MARKERS)
 
 
 def is_retryable_exception(exc: Exception) -> bool:
+    if is_run_terminal_ai_exception(exc):
+        return False
     status_code = get_status_code(exc)
     if status_code is None:
         return True
@@ -203,7 +323,7 @@ def retry_delay_seconds(attempt: int, base_seconds: float, max_seconds: float, e
 
 def build_fallback_ai_fields(item: Dict, reason: str, exc: Exception = None) -> Dict:
     abstract = item.get("summary") or "Original abstract unavailable."
-    details = f"AI enhancement failed after retries ({reason}). Original arXiv metadata is preserved."
+    details = f"AI enhancement unavailable ({reason}). Original arXiv metadata is preserved."
     if exc is not None:
         details = f"{details} Error: {short_error(exc)}"
 
@@ -216,13 +336,22 @@ def build_fallback_ai_fields(item: Dict, reason: str, exc: Exception = None) -> 
     }
 
 
-def apply_ai_fallback(item: Dict, reason: str, error: str = None, exc: Exception = None) -> Dict:
+def apply_ai_fallback(
+    item: Dict,
+    reason: str,
+    error: str = None,
+    exc: Exception = None,
+    deferred: bool = False,
+) -> Dict:
     item['AI'] = build_fallback_ai_fields(item, reason, exc)
-    item['AI_status'] = "fallback"
+    item['AI_status'] = "deferred" if deferred else "fallback"
+    item['AI_failure_reason'] = reason
     if error is not None:
         item['AI_error'] = error
     elif exc is not None:
         item['AI_error'] = short_error(exc)
+    else:
+        item.pop('AI_error', None)
     return item
 
 
@@ -246,20 +375,32 @@ def record_ai_success():
 
 def record_ai_failure(item_id: str, exc: Exception):
     global AI_CONSECUTIVE_FAILURES, AI_CIRCUIT_OPEN
+    terminal_error = is_run_terminal_ai_exception(exc)
+    retryable_error = is_retryable_exception(exc)
+    opened_reason = None
     with STATE_LOCK:
+        if not terminal_error and not retryable_error:
+            AI_CONSECUTIVE_FAILURES = 0
+            return
+
         AI_CONSECUTIVE_FAILURES += 1
-        if (
+        if terminal_error and not AI_CIRCUIT_OPEN:
+            AI_CIRCUIT_OPEN = True
+            opened_reason = "non-retryable account or provider error"
+        elif (
             AI_CIRCUIT_BREAKER_FAILURES > 0
             and not AI_CIRCUIT_OPEN
             and AI_CONSECUTIVE_FAILURES >= AI_CIRCUIT_BREAKER_FAILURES
         ):
             AI_CIRCUIT_OPEN = True
-            print(
-                f"AI circuit opened after {AI_CONSECUTIVE_FAILURES} consecutive failures; "
-                f"remaining items will keep metadata with fallback AI fields. Last item: {item_id}. "
-                f"Last error: {short_error(exc)}",
-                file=sys.stderr,
-            )
+            opened_reason = f"{AI_CONSECUTIVE_FAILURES} consecutive retryable failures"
+
+    if opened_reason is not None:
+        print(
+            f"AI circuit opened after {opened_reason}; remaining items will keep metadata "
+            f"as deferred AI results. Last item: {item_id}. Last error: {short_error(exc)}",
+            file=sys.stderr,
+        )
 
 
 def wait_for_ai_rate_limit():
@@ -546,7 +687,7 @@ def build_chain(model_name: str):
         model=model_name,
         timeout=AI_REQUEST_TIMEOUT_SECONDS,
         max_retries=AI_SDK_MAX_RETRIES,
-        model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},
+        extra_body={"thinking": {"type": "disabled"}},
     ).with_structured_output(Structure, method="function_calling")
 
     prompt_template = ChatPromptTemplate.from_messages([
@@ -605,6 +746,22 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
                 
         return code_info
 
+    fallback_ai_fields = build_fallback_ai_fields(item, "not_started")
+
+    if has_metadata_fallback(item):
+        return apply_ai_fallback(
+            item,
+            "metadata_unavailable",
+            "AI enhancement skipped because arXiv metadata was unavailable.",
+        )
+    if is_ai_circuit_open():
+        return apply_ai_fallback(
+            item,
+            "ai_circuit_open",
+            "AI enhancement deferred after an account-wide or repeated failure in this run.",
+            deferred=True,
+        )
+
     ai_input = build_ai_input(item)
 
     # 检查输入内容
@@ -616,57 +773,50 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
     if code_info:
         item.update(code_info)
 
-    fallback_ai_fields = build_fallback_ai_fields(item, "not_started")
+    try:
+        response: Structure = invoke_with_retries(chain, {
+            "language": language,
+            "content": ai_input
+        }, item.get("id", "unknown"))
+        item['AI'] = response.model_dump()
+        item['AI_status'] = "ok"
+        item.pop('AI_error', None)
+        item.pop('AI_failure_reason', None)
+        record_ai_success()
+    except langchain_core.exceptions.OutputParserException as e:
+        record_ai_failure(item.get("id", "unknown"), e)
+        # 尝试从错误信息中提取 JSON 字符串并修复
+        error_msg = str(e)
+        partial_data = {}
 
-    if has_metadata_fallback(item):
+        if "Function Structure arguments:" in error_msg:
+            try:
+                # 提取 JSON 字符串
+                json_str = error_msg.split("Function Structure arguments:", 1)[1].strip().split('are not valid JSON')[0].strip()
+                # 预处理 LaTeX 数学符号 - 使用四个反斜杠来确保正确转义
+                json_str = json_str.replace('\\', '\\\\')
+                # 尝试解析修复后的 JSON
+                partial_data = json.loads(json_str)
+            except Exception as json_e:
+                print(f"Failed to parse JSON for {item.get('id', 'unknown')}: {json_e}", file=sys.stderr)
+
+        # Merge partial data with fallback data to ensure metadata is preserved.
+        item['AI'] = {**build_fallback_ai_fields(item, "output_parser_error", e), **partial_data}
+        item['AI_status'] = "partial" if partial_data else "deferred"
+        item['AI_failure_reason'] = "output_parser_error"
+        item['AI_error'] = short_error(e)
+        print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
+    except Exception as e:
+        terminal_error = is_run_terminal_ai_exception(e)
+        record_ai_failure(item.get("id", "unknown"), e)
+        # Catch any other exceptions and keep the original arXiv metadata.
+        print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
         apply_ai_fallback(
             item,
-            "metadata_unavailable",
-            "AI enhancement skipped because arXiv metadata was unavailable.",
+            "provider_account_error" if terminal_error else "llm_error",
+            exc=e,
+            deferred=terminal_error or is_retryable_exception(e),
         )
-    elif is_ai_circuit_open():
-        apply_ai_fallback(
-            item,
-            "ai_circuit_open",
-            "AI enhancement skipped after repeated failures in this run.",
-        )
-    else:
-        try:
-            response: Structure = invoke_with_retries(chain, {
-                "language": language,
-                "content": ai_input
-            }, item.get("id", "unknown"))
-            item['AI'] = response.model_dump()
-            item['AI_status'] = "ok"
-            item.pop('AI_error', None)
-            record_ai_success()
-        except langchain_core.exceptions.OutputParserException as e:
-            record_ai_failure(item.get("id", "unknown"), e)
-            # 尝试从错误信息中提取 JSON 字符串并修复
-            error_msg = str(e)
-            partial_data = {}
-
-            if "Function Structure arguments:" in error_msg:
-                try:
-                    # 提取 JSON 字符串
-                    json_str = error_msg.split("Function Structure arguments:", 1)[1].strip().split('are not valid JSON')[0].strip()
-                    # 预处理 LaTeX 数学符号 - 使用四个反斜杠来确保正确转义
-                    json_str = json_str.replace('\\', '\\\\')
-                    # 尝试解析修复后的 JSON
-                    partial_data = json.loads(json_str)
-                except Exception as json_e:
-                    print(f"Failed to parse JSON for {item.get('id', 'unknown')}: {json_e}", file=sys.stderr)
-
-            # Merge partial data with fallback data to ensure metadata is preserved.
-            item['AI'] = {**build_fallback_ai_fields(item, "output_parser_error", e), **partial_data}
-            item['AI_status'] = "partial" if partial_data else "fallback"
-            item['AI_error'] = short_error(e)
-            print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
-        except Exception as e:
-            record_ai_failure(item.get("id", "unknown"), e)
-            # Catch any other exceptions and keep the original arXiv metadata.
-            print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-            apply_ai_fallback(item, "llm_error", exc=e)
     
     # Final validation to ensure all required fields exist
     for field in REQUIRED_AI_FIELDS:
@@ -689,14 +839,10 @@ def process_single_item_timed(chain, item: Dict, language: str):
 
 
 def is_resumable_result(item: Dict) -> bool:
-    if not item.get("id") or "AI" not in item:
-        return False
-    if AI_INPUT_SOURCE == "full" and item.get("AI_input_source") not in {"full", "abstract"}:
-        return False
-    return True
+    return is_resumable_ai_result(item, AI_INPUT_SOURCE)
 
 
-def load_existing_results(target_file: str, raw_ids: set) -> Dict:
+def load_checkpoint_results(target_file: str, raw_ids: set) -> Dict:
     if not os.path.exists(target_file):
         return {}
 
@@ -711,9 +857,17 @@ def load_existing_results(target_file: str, raw_ids: set) -> Dict:
                 print(f"Skipping invalid checkpoint line: {short_error(exc)}", file=sys.stderr)
                 continue
             item_id = item.get("id")
-            if item_id in raw_ids and is_resumable_result(item):
+            if item_id in raw_ids and item.get("AI"):
                 results[item_id] = item
     return results
+
+
+def load_existing_results(target_file: str, raw_ids: set) -> Dict:
+    return {
+        item_id: item
+        for item_id, item in load_checkpoint_results(target_file, raw_ids).items()
+        if is_resumable_result(item)
+    }
 
 
 def save_checkpoint(target_file: str, ordered_data: List[Dict], processed_by_id: Dict):
@@ -746,6 +900,7 @@ def process_all_items(
     max_workers: int,
     target_file: str,
     processed_by_id: Dict,
+    checkpoint_by_id: Dict = None,
 ) -> List[Dict]:
     """并行处理所有数据项"""
     print('Connect to:', model_name, file=sys.stderr)
@@ -757,14 +912,16 @@ def process_all_items(
     )
 
     chain = build_chain(model_name)
+    if checkpoint_by_id is None:
+        checkpoint_by_id = dict(processed_by_id)
     pending_data = [item for item in data if item.get("id") not in processed_by_id]
     print(
         f"AI resume state: existing={len(processed_by_id)}, pending={len(pending_data)}, total={len(data)}",
         file=sys.stderr,
     )
     if not pending_data:
-        save_checkpoint(target_file, data, processed_by_id)
-        return ordered_processed_rows(data, processed_by_id)
+        save_checkpoint(target_file, data, checkpoint_by_id)
+        return ordered_processed_rows(data, checkpoint_by_id)
 
     if AI_MAX_SECONDS > 0:
         started_at = time.monotonic()
@@ -773,22 +930,33 @@ def process_all_items(
             item_started_at = time.monotonic()
             item_id = item.get("id", "unknown")
             if is_ai_time_budget_exceeded(started_at):
-                processed_by_id[item_id] = apply_ai_fallback(
+                result = apply_ai_fallback(
                     item,
                     "time_budget_exceeded",
                     "AI enhancement skipped because the workflow time budget was reached.",
+                    deferred=True,
                 )
-                save_checkpoint(target_file, data, processed_by_id)
+                processed_by_id[item_id] = result
+                checkpoint_by_id[item_id] = result
+                save_checkpoint(target_file, data, checkpoint_by_id)
                 continue
             try:
                 result = process_single_item(chain, item, language)
                 if result is None:
                     continue
                 processed_by_id[item_id] = result
+                checkpoint_by_id[item_id] = result
             except Exception as e:
                 print(f"Item {item.get('id', 'unknown')} generated an exception: {e}", file=sys.stderr)
-                processed_by_id[item_id] = apply_ai_fallback(item, "worker_error", exc=e)
-            save_checkpoint(target_file, data, processed_by_id)
+                result = apply_ai_fallback(
+                    item,
+                    "worker_error",
+                    exc=e,
+                    deferred=True,
+                )
+                processed_by_id[item_id] = result
+                checkpoint_by_id[item_id] = result
+            save_checkpoint(target_file, data, checkpoint_by_id)
             processed_count += 1
             log_ci_progress(
                 len(processed_by_id),
@@ -797,7 +965,7 @@ def process_all_items(
                 started_at,
                 time.monotonic() - item_started_at,
             )
-        return ordered_processed_rows(data, processed_by_id)
+        return ordered_processed_rows(data, checkpoint_by_id)
     
     # 使用线程池并行处理
     started_at = time.monotonic()
@@ -826,14 +994,19 @@ def process_all_items(
                     raise worker_error
                 if result is not None:
                     processed_by_id[item_id] = result
+                    checkpoint_by_id[item_id] = result
             except Exception as e:
                 print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
                 # Keep metadata even when worker-level processing fails.
-                processed_by_id[item_id] = source_item
-                processed_by_id[item_id]['AI'] = build_fallback_ai_fields(source_item, "worker_error", e)
-                processed_by_id[item_id]['AI_status'] = "fallback"
-                processed_by_id[item_id]['AI_error'] = short_error(e)
-            save_checkpoint(target_file, data, processed_by_id)
+                result = apply_ai_fallback(
+                    source_item,
+                    "worker_error",
+                    exc=e,
+                    deferred=True,
+                )
+                processed_by_id[item_id] = result
+                checkpoint_by_id[item_id] = result
+            save_checkpoint(target_file, data, checkpoint_by_id)
             processed_count += 1
             log_ci_progress(
                 len(processed_by_id),
@@ -843,7 +1016,7 @@ def process_all_items(
                 item_finished_at - item_started_at,
             )
     
-    return ordered_processed_rows(data, processed_by_id)
+    return ordered_processed_rows(data, checkpoint_by_id)
 
 def main():
     args = parse_args()
@@ -868,7 +1041,12 @@ def main():
 
     data = unique_data
     print('Open:', args.data, file=sys.stderr)
-    existing_results = load_existing_results(target_file, seen_ids)
+    checkpoint_results = load_checkpoint_results(target_file, seen_ids)
+    existing_results = {
+        item_id: item
+        for item_id, item in checkpoint_results.items()
+        if is_resumable_result(item)
+    }
     
     # 并行处理所有数据
     processed_data = process_all_items(
@@ -878,6 +1056,7 @@ def main():
         args.max_workers,
         target_file,
         existing_results,
+        checkpoint_results,
     )
     
     # 保存结果

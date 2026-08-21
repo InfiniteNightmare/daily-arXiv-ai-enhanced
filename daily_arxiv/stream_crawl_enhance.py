@@ -373,9 +373,12 @@ def stream_crawl_and_enhance(args) -> int:
             except Exception as exc:
                 seq, item = task
                 print(f"Worker {worker_index} failed for {item.get('id', 'unknown')}: {exc}", file=sys.stderr)
-                item["AI"] = enhance.build_fallback_ai_fields(item, "stream_worker_error", exc)
-                item["AI_status"] = "fallback"
-                item["AI_error"] = enhance.short_error(exc)
+                enhance.apply_ai_fallback(
+                    item,
+                    "stream_worker_error",
+                    exc=exc,
+                    deferred=True,
+                )
                 with results_lock:
                     results.append((seq, item))
             finally:
