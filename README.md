@@ -43,11 +43,14 @@ https://github.com/user-attachments/assets/b25712a4-fb8d-484f-863d-e8da6922f9d7
 
 
 # How to use
-This repo will daily crawl arXiv papers about **cs.CV, cs.GR, cs.CL and cs.AI**, and use **DeepSeek** to summarize the papers in **Chinese**.
+This repo will daily crawl arXiv papers about **cs.CV, cs.GR, cs.CL, cs.AI, cs.CE, cs.GT, cs.IT, cs.LG**, and use **DeepSeek** to summarize the papers in **Chinese**.
 If you wish to crawl other arXiv categories, use other LLMs, or other languages, please follow the instructions.
-Otherwise, you can directly use this repo in https://dw-dengwei.github.io/daily-arXiv-ai-enhanced/. Please star it if you like :)
+Otherwise, you can watch the video above first and directly use this repo in https://dw-dengwei.github.io/daily-arXiv-ai-enhanced/. Please star it if you like :)
 
-**Instructions:**
+<details>
+   <summary> If you want to customize categories, LLMs, or languages, click here.  </summary>
+
+## Instructions
 1. Fork this repo to your own account and delete my own information in [buy-me-a-coffee](./buy-me-a-coffee/README.md).
 2. Go to: your-own-repo -> Settings -> Secrets and variables -> Actions
 3. Go to Secrets. Secrets are encrypted and used for sensitive data
@@ -63,6 +66,8 @@ Otherwise, you can directly use this repo in https://dw-dengwei.github.io/daily-
 8. Go to your-own-repo -> Actions -> arXiv-daily-ai-enhanced
 9. You can manually click **Run workflow** to test if it works well (it may take about one hour). By default, this action will automatically run every day. You can modify it in `.github/workflows/run.yml`
 10. Set up GitHub pages: Go to your own repo -> Settings -> Pages. In `Build and deployment`, set `Source="Deploy from a branch"`, `Branch="main", "/(root)"`. Wait for a few minutes, go to https://\<username\>.github.io/daily-arXiv-ai-enhanced/. Please see this [issue](https://github.com/dw-dengwei/daily-arXiv-ai-enhanced/issues/14) for more precise instructions.
+
+</details>
 
 ## Optional workflow variables
 
@@ -95,9 +100,6 @@ When `AI_INPUT_SOURCE=full`, these additional variables control full-text fetchi
 | `AI_FULL_TEXT_RETRY_BASE_SECONDS` | `2` | Base delay for full-text fetch retry backoff. |
 | `AI_FULL_TEXT_RETRY_MAX_SECONDS` | `30` | Maximum delay for full-text fetch retry backoff. |
 | `AI_FULL_TEXT_MIN_CHARS` | `2000` | Minimum extracted full-text length. Shorter content is treated as unavailable and falls back to abstract. |
-
-# Plans
-See https://github.com/users/dw-dengwei/projects/3
 
 # Contributors
 Thanks to the following special contributors for contributing code, discovering bugs, and sharing useful ideas for this project!!!

@@ -546,6 +546,7 @@ def build_chain(model_name: str):
         model=model_name,
         timeout=AI_REQUEST_TIMEOUT_SECONDS,
         max_retries=AI_SDK_MAX_RETRIES,
+        model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},
     ).with_structured_output(Structure, method="function_calling")
 
     prompt_template = ChatPromptTemplate.from_messages([
