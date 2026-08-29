@@ -73,7 +73,7 @@ Otherwise, you can watch the video above first and directly use this repo in htt
 
 Set these in **Settings -> Secrets and variables -> Actions -> Variables**.
 
-The scheduled workflow runs at `02:15`, `08:15`, `14:15`, and `20:15` UTC on weekdays. Each run has a 5-hour timeout and uses checkpointed crawl metadata and AI results on the `data` branch, so a later run can continue the same UTC day's unfinished work. Any AI result that is not a complete structured success is deferred and retried by the next scheduled run for that UTC date, while completed papers are preserved. If the raw data, AI-enhanced JSONL, and Markdown file for the day are already complete, the workflow exits early without reprocessing. Historical dates can be resumed manually with the `process_date` workflow input.
+The scheduled workflow runs at `02:15`, `08:15`, `14:15`, and `20:15` UTC on weekdays. Each run has a 5-hour timeout and uses checkpointed crawl metadata and AI results on the `data` branch, so a later run can continue the same UTC day's unfinished work. Scheduled runs resolve the processing date from their cron slot, so a GitHub Actions delay past UTC midnight still resumes the date that the run was scheduled for. Any AI result that is not a complete structured success is deferred and retried by the next scheduled run for that UTC date, while completed papers are preserved. If the raw data, AI-enhanced JSONL, and Markdown file for the day are already complete, the workflow exits early without reprocessing. Historical dates can be resumed manually with the `process_date` workflow input.
 
 | Variable | Default | Usage |
 | --- | --- | --- |

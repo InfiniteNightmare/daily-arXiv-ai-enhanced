@@ -5,7 +5,10 @@ name: arXiv-daily-ai-enhanced
 
 on:
   schedule:
-    - cron: "15 2,8,14,20 * * 1-5"
+    - cron: "15 2 * * 1-5"
+    - cron: "15 8 * * 1-5"
+    - cron: "15 14 * * 1-5"
+    - cron: "15 20 * * 1-5"
   workflow_dispatch:
     inputs:
       process_date:
@@ -60,6 +63,10 @@ jobs:
 
         if [ -n "$requested_date" ]; then
           today="$requested_date"
+        elif [ "${{ github.event_name }}" = "schedule" ]; then
+          scheduled_cron="${{ github.event.schedule }}"
+          today=$(python daily_arxiv/schedule_date.py "$scheduled_cron")
+          echo "定时槽位 $scheduled_cron 对应处理日期 $today / Scheduled slot $scheduled_cron resolves to $today"
         else
           today="$current_utc_date"
         fi
