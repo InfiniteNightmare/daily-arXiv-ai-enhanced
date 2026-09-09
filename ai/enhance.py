@@ -284,12 +284,19 @@ def is_run_terminal_ai_exception(exc: Exception) -> bool:
 
 
 def is_retryable_exception(exc: Exception) -> bool:
-    if is_run_terminal_ai_exception(exc):
-        return False
+    return not is_run_terminal_ai_exception(exc)
+
+
+def is_ai_circuit_breaker_failure(exc: Exception) -> bool:
     status_code = get_status_code(exc)
-    if status_code is None:
-        return True
-    return status_code in RETRYABLE_HTTP_STATUS_CODES or status_code >= 500
+    if status_code is not None:
+        return status_code in RETRYABLE_HTTP_STATUS_CODES or status_code >= 500
+
+    return any(
+        marker in current.__class__.__name__.lower()
+        for current in iter_exception_chain(exc)
+        for marker in ("connection", "timeout")
+    )
 
 
 def parse_retry_after_seconds(exc: Exception):
@@ -379,10 +386,10 @@ def record_ai_success():
 def record_ai_failure(item_id: str, exc: Exception):
     global AI_CONSECUTIVE_FAILURES, AI_CIRCUIT_OPEN
     terminal_error = is_run_terminal_ai_exception(exc)
-    retryable_error = is_retryable_exception(exc)
+    circuit_breaker_failure = is_ai_circuit_breaker_failure(exc)
     opened_reason = None
     with STATE_LOCK:
-        if not terminal_error and not retryable_error:
+        if not terminal_error and not circuit_breaker_failure:
             AI_CONSECUTIVE_FAILURES = 0
             return
 

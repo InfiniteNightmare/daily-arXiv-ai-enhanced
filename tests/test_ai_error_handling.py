@@ -270,10 +270,22 @@ class CircuitBreakerTests(EnhanceStateTestCase):
 
         self.assertTrue(enhance.is_ai_circuit_open())
 
-    def test_ordinary_422_does_not_open_circuit(self):
+    def test_repeated_ordinary_422_errors_do_not_open_circuit(self):
+        enhance.AI_CIRCUIT_BREAKER_FAILURES = 2
+
         enhance.record_ai_failure("2608.12345", ordinary_422_error())
+        enhance.record_ai_failure("2608.12346", ordinary_422_error())
 
         self.assertFalse(enhance.is_ai_circuit_open())
+
+    def test_repeated_provider_outages_still_open_circuit(self):
+        enhance.AI_CIRCUIT_BREAKER_FAILURES = 2
+        outage = ProviderError("service unavailable", status_code=503)
+
+        enhance.record_ai_failure("2608.12345", outage)
+        enhance.record_ai_failure("2608.12346", outage)
+
+        self.assertTrue(enhance.is_ai_circuit_open())
 
 
 class RetryPolicyTests(EnhanceStateTestCase):
@@ -305,6 +317,23 @@ class RetryPolicyTests(EnhanceStateTestCase):
 
         self.assertEqual(len(rate_limit_chain.calls), enhance.AI_RETRY_ATTEMPTS)
         self.assertEqual(rate_limit_sleep.call_count, enhance.AI_RETRY_ATTEMPTS - 1)
+
+    def test_item_specific_422_exhausts_retries(self):
+        chain = FakeChain(ordinary_422_error())
+
+        with (
+            mock.patch.object(enhance.time, "sleep") as retry_sleep,
+            mock.patch.object(enhance.random, "uniform", return_value=0.0),
+        ):
+            with self.assertRaises(ProviderError):
+                enhance.invoke_with_retries(
+                    chain,
+                    {"language": "Chinese", "content": "paper"},
+                    "2608.422",
+                )
+
+        self.assertEqual(len(chain.calls), enhance.AI_RETRY_ATTEMPTS)
+        self.assertEqual(retry_sleep.call_count, enhance.AI_RETRY_ATTEMPTS - 1)
 
     def test_incomplete_structured_response_is_retried_until_complete(self):
         incomplete_fields = complete_ai_fields()
@@ -391,7 +420,7 @@ class SingleItemFailureFlowTests(EnhanceStateTestCase):
         self.assert_metadata_preserved(original, processed)
         self.assertEqual(set(enhance.REQUIRED_AI_FIELDS) - set(processed["AI"]), set())
 
-    def test_ordinary_422_defers_without_opening_circuit(self):
+    def test_ordinary_422_retries_then_defers_without_opening_circuit(self):
         original = sample_item()
         item = copy.deepcopy(original)
         chain = FakeChain(ordinary_422_error())
@@ -403,8 +432,8 @@ class SingleItemFailureFlowTests(EnhanceStateTestCase):
         ):
             processed = enhance.process_single_item(chain, item, "Chinese")
 
-        self.assertEqual(len(chain.calls), 1)
-        sleep.assert_not_called()
+        self.assertEqual(len(chain.calls), enhance.AI_RETRY_ATTEMPTS)
+        self.assertEqual(sleep.call_count, enhance.AI_RETRY_ATTEMPTS - 1)
         self.assertFalse(enhance.is_ai_circuit_open())
         self.assertEqual(processed["AI_status"], "deferred")
         self.assert_metadata_preserved(original, processed)
