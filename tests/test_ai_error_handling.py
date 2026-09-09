@@ -68,6 +68,19 @@ class SuccessfulChain:
         return self.response
 
 
+class SequencedChain:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = []
+
+    def invoke(self, payload):
+        self.calls.append(payload)
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
 def minimax_balance_error():
     body = {
         "type": "error",
@@ -293,6 +306,30 @@ class RetryPolicyTests(EnhanceStateTestCase):
         self.assertEqual(len(rate_limit_chain.calls), enhance.AI_RETRY_ATTEMPTS)
         self.assertEqual(rate_limit_sleep.call_count, enhance.AI_RETRY_ATTEMPTS - 1)
 
+    def test_incomplete_structured_response_is_retried_until_complete(self):
+        incomplete_fields = complete_ai_fields()
+        incomplete_fields["result"] = ""
+        chain = SequencedChain(
+            [
+                FakeStructuredResponse(incomplete_fields),
+                FakeStructuredResponse(complete_ai_fields("complete after retry")),
+            ]
+        )
+
+        with (
+            mock.patch.object(enhance.time, "sleep") as retry_sleep,
+            mock.patch.object(enhance.random, "uniform", return_value=0.0),
+        ):
+            response = enhance.invoke_with_retries(
+                chain,
+                {"language": "Chinese", "content": "paper"},
+                "2608.incomplete",
+            )
+
+        self.assertEqual(response.model_dump()["result"], "complete after retry")
+        self.assertEqual(len(chain.calls), 2)
+        retry_sleep.assert_called_once()
+
 
 class SingleItemFailureFlowTests(EnhanceStateTestCase):
     def test_metadata_fallback_is_deferred_without_calling_llm(self):
@@ -425,9 +462,13 @@ class SingleItemFailureFlowTests(EnhanceStateTestCase):
         with (
             mock.patch.object(enhance, "build_ai_input", return_value=item["summary"]),
             mock.patch.object(enhance, "is_sensitive", return_value=False),
+            mock.patch.object(enhance.time, "sleep") as retry_sleep,
+            mock.patch.object(enhance.random, "uniform", return_value=0.0),
         ):
             processed = enhance.process_single_item(chain, item, "Chinese")
 
+        self.assertEqual(len(chain.calls), enhance.AI_RETRY_ATTEMPTS)
+        self.assertEqual(retry_sleep.call_count, enhance.AI_RETRY_ATTEMPTS - 1)
         self.assertEqual(processed["AI_status"], "deferred")
         self.assertEqual(processed["AI_failure_reason"], "incomplete_output")
 

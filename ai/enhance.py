@@ -64,6 +64,10 @@ REQUIRED_AI_FIELDS = ["tldr", "motivation", "method", "result", "conclusion"]
 SENSITIVE_CHECK_URL = os.environ.get("SENSITIVE_CHECK_URL", "https://spam.dw-dengwei.workers.dev")
 
 
+class IncompleteAIResponseError(ValueError):
+    """The provider returned a response that cannot be saved as a complete AI result."""
+
+
 def get_env_int(name: str, default: int, min_value: int = 0) -> int:
     try:
         value = int(os.environ.get(name, default))
@@ -568,9 +572,27 @@ def invoke_with_retries(chain, payload: Dict, item_id: str) -> Structure:
             wait_for_ai_rate_limit()
             response = chain.invoke(payload)
             if response is None:
-                raise ValueError("AI returned empty structured response")
+                raise IncompleteAIResponseError("AI returned empty structured response")
             if not hasattr(response, "model_dump"):
-                raise ValueError(f"AI returned unsupported structured response: {type(response).__name__}")
+                raise IncompleteAIResponseError(
+                    f"AI returned unsupported structured response: {type(response).__name__}"
+                )
+            response_fields = response.model_dump()
+            if not isinstance(response_fields, dict):
+                raise IncompleteAIResponseError(
+                    "AI returned a structured response whose serialized value is not an object"
+                )
+            if not has_complete_ai_fields({"AI": response_fields}):
+                missing_fields = [
+                    field
+                    for field in REQUIRED_AI_FIELDS
+                    if not isinstance(response_fields.get(field), str)
+                    or not response_fields[field].strip()
+                ]
+                raise IncompleteAIResponseError(
+                    "AI returned an incomplete structured response; missing or empty fields: "
+                    + ", ".join(missing_fields)
+                )
             return response
         except Exception as exc:
             if attempt >= AI_RETRY_ATTEMPTS or not is_retryable_exception(exc):
@@ -781,19 +803,19 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             "content": ai_input
         }, item.get("id", "unknown"))
         item['AI'] = response.model_dump()
-        if has_complete_ai_fields(item):
-            item['AI_status'] = "ok"
-            item.pop('AI_error', None)
-            item.pop('AI_failure_reason', None)
-            record_ai_success()
-        else:
-            incomplete_error = ValueError("AI returned an incomplete structured response")
-            record_ai_failure(item.get("id", "unknown"), incomplete_error)
-            apply_ai_fallback(
-                item,
-                "incomplete_output",
-                "AI enhancement deferred because the structured response was incomplete.",
-            )
+        item['AI_status'] = "ok"
+        item.pop('AI_error', None)
+        item.pop('AI_failure_reason', None)
+        record_ai_success()
+    except IncompleteAIResponseError as e:
+        record_ai_failure(item.get("id", "unknown"), e)
+        print(f"Incomplete AI response for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
+        apply_ai_fallback(
+            item,
+            "incomplete_output",
+            "AI enhancement deferred because the structured response remained incomplete "
+            "after retries.",
+        )
     except langchain_core.exceptions.OutputParserException as e:
         record_ai_failure(item.get("id", "unknown"), e)
         # 尝试从错误信息中提取 JSON 字符串并修复
