@@ -381,6 +381,13 @@
   .range-selector {
     width: 100%;
   }
+
+  /* 输入框与 Add 按钮同行时，输入框收缩让出按钮空间，避免互相遮挡 */
+  .tag-input-container .settings-input {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+  }
   
   .settings-actions {
     flex-direction: column-reverse;

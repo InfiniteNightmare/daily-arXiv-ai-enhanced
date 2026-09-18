@@ -74,6 +74,7 @@ function renderFilterTags() {
       filterTagsElement.style.display = 'none';
       filterTagsElement.innerHTML = '';
     }
+    updateScrollFade(filterTagsElement);
     return;
   }
   
@@ -122,7 +123,7 @@ function renderFilterTags() {
       });
       
       filterTagsElement.appendChild(tagElement);
-      
+
       // 添加出现动画后移除动画类
       if (!activeKeywords.includes(keyword)) {
         tagElement.classList.add('tag-appear');
@@ -132,6 +133,8 @@ function renderFilterTags() {
       }
     });
   }
+
+  updateScrollFade(filterTagsElement);
 }
 
 // 切换关键词过滤
@@ -369,6 +372,7 @@ function matchPapersByKeywordsOrAuthor(papers, keywords, author) {
 
 document.addEventListener('DOMContentLoaded', () => {
   initEventListeners();
+  initScrollFade();
 
   fetchGitHubStats();
 
@@ -959,6 +963,25 @@ function getAllCategories(data) {
   };
 }
 
+// 分类/筛选行边缘渐隐：根据滚动位置切换 at-start / at-end 状态，
+// 提示用户横向还有更多内容可滑动
+function updateScrollFade(el) {
+  if (!el) return;
+  const maxScroll = el.scrollWidth - el.clientWidth;
+  el.classList.toggle('at-start', el.scrollLeft <= 1);
+  el.classList.toggle('at-end', el.scrollLeft >= maxScroll - 1);
+}
+
+function initScrollFade() {
+  document.querySelectorAll('.category-scroll, .filter-scroll').forEach(el => {
+    updateScrollFade(el);
+    el.addEventListener('scroll', () => updateScrollFade(el), { passive: true });
+  });
+  window.addEventListener('resize', () => {
+    document.querySelectorAll('.category-scroll, .filter-scroll').forEach(updateScrollFade);
+  });
+}
+
 function renderCategoryFilter(categories) {
   const container = document.querySelector('.category-scroll');
   const { sortedCategories, categoryCounts } = categories;
@@ -988,6 +1011,8 @@ function renderCategoryFilter(categories) {
   document.querySelector('.category-button[data-category="all"]').addEventListener('click', () => {
     filterByCategory('all');
   });
+
+  updateScrollFade(container);
 }
 
 function filterByCategory(category) {

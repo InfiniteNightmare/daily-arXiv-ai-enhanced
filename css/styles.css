@@ -423,6 +423,29 @@ header {
   display: none;
 }
 
+/* 分类/筛选行横向滚动的边缘渐隐：未滚动时右侧渐隐提示还有更多，
+   滚动到底后对应侧的渐隐消失（at-start/at-end 由 app.js 维护） */
+.category-scroll, .filter-scroll {
+  --fade-size: 28px;
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 var(--fade-size), #000 calc(100% - var(--fade-size)), transparent 100%);
+  mask-image: linear-gradient(to right, transparent 0, #000 var(--fade-size), #000 calc(100% - var(--fade-size)), transparent 100%);
+}
+
+.category-scroll.at-start, .filter-scroll.at-start {
+  -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - var(--fade-size)), transparent 100%);
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - var(--fade-size)), transparent 100%);
+}
+
+.category-scroll.at-end, .filter-scroll.at-end {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 var(--fade-size), #000 100%);
+  mask-image: linear-gradient(to right, transparent 0, #000 var(--fade-size), #000 100%);
+}
+
+.category-scroll.at-start.at-end, .filter-scroll.at-start.at-end {
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+
 .filter-label-container {
   display: flex;
   align-items: center;
@@ -1225,22 +1248,55 @@ input:checked + .toggle-slider:before {
 @media (max-width: 768px) {
   .header-content {
     padding: 12px 16px;
+    flex-wrap: wrap;
+    row-gap: 4px;
   }
-  
+
   .header-center {
     position: static;
     transform: none;
     margin-bottom: 8px;
+    min-width: 0;
+    max-width: 100%;
   }
-  
+
+  .site-logo {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .site-title {
+    font-size: 16px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .header-left {
     display: none;
   }
-  
+
   .header-controls {
     margin-left: auto;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .date-display {
+    font-size: 14px;
   }
   
+  .category-label-container,
+  .filter-label-container {
+    padding: 8px 0 0;
+  }
+
+  .category-nav-label,
+  .filter-nav-label {
+    min-width: 64px;
+    flex-shrink: 0; /* 防止被 100% 宽的滚动区挤压截断 */
+  }
+
   .category-scroll {
     padding: 8px 16px;
     max-width: 100%; /* 在移动端占满宽度 */
@@ -1272,6 +1328,12 @@ input:checked + .toggle-slider:before {
   .paper-container {
     padding: 0;
     margin-top: 16px;
+    grid-template-columns: 1fr; /* 窄屏单列，避免 350px 最小列宽导致横向溢出 */
+    gap: 20px;
+  }
+
+  #textSearchInput {
+    width: 140px;
   }
   
   .keyword-tag-container {
@@ -1688,9 +1750,6 @@ footer {
   margin-left: 4px;
   letter-spacing: 0;
   text-transform: none;
-}
-
-  padding-left: 3px; /* 减少左侧内边距 */
 }
 
 

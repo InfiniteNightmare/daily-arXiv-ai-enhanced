@@ -6,26 +6,6 @@ let isRangeMode = false;
 let allPapersData = [];
 
 document.addEventListener('DOMContentLoaded', () => {
-  // Check screen size
-  const checkScreenSize = () => {
-    if (window.innerWidth < 768) {
-      const warningModal = document.createElement('div');
-      warningModal.className = 'screen-size-warning';
-      warningModal.innerHTML = `
-        <div class="warning-content">
-          <h3>⚠️ Screen Size Notice</h3>
-          <p>We've detected that you're using a device with a small screen. For the best data visualization experience, we recommend viewing this statistics page on a larger screen device (such as a tablet or computer).</p>
-          <button onclick="this.parentElement.parentElement.remove()">Got it</button>
-        </div>
-      `;
-      document.body.appendChild(warningModal);
-    }
-  };
-
-  checkScreenSize();
-  // Recheck on window resize
-  window.addEventListener('resize', checkScreenSize);
-
   initEventListeners();
   fetchGitHubStats();
   
@@ -467,15 +447,24 @@ async function loadPapersByDateRange(startDate, endDate) {
 
     // 只在日期范围模式下创建趋势图
     if (startDate !== endDate) {
-      // 创建折线图
-      const margin = {top: 20, right: 180, bottom: 80, left: 60}; // 增加底部边距以适应更长的日期标签
-      const width = document.getElementById('trendChart').offsetWidth - margin.left - margin.right;
-      const height = 400 - margin.top - margin.bottom;
+      // 创建折线图；窄屏收窄边距并把图例移到图表下方，避免绘图区被挤压
+      const chartEl = document.getElementById('trendChart');
+      const chartStyle = getComputedStyle(chartEl);
+      const chartInnerWidth = chartEl.offsetWidth
+        - parseFloat(chartStyle.paddingLeft) - parseFloat(chartStyle.paddingRight);
+      const isNarrow = chartInnerWidth < 480;
+      const margin = isNarrow
+        ? {top: 20, right: 16, bottom: 80, left: 44}
+        : {top: 20, right: 180, bottom: 80, left: 60}; // 增加底部边距以适应更长的日期标签
+      const width = Math.max(chartInnerWidth - margin.left - margin.right, 120);
+      const height = (isNarrow ? 340 : 400) - margin.top - margin.bottom;
+      // 窄屏图例放两列显示在图表（含 x 轴标题）下方
+      const legendHeight = isNarrow ? Math.ceil(trendData.length / 2) * 24 + 24 : 0;
 
       const svg = d3.select('#trendChart')
         .append('svg')
           .attr('width', width + margin.left + margin.right)
-          .attr('height', height + margin.top + margin.bottom)
+          .attr('height', height + margin.top + margin.bottom + legendHeight)
         .append('g')
           .attr('transform', `translate(${margin.left},${margin.top})`);
 
@@ -660,7 +649,9 @@ async function loadPapersByDateRange(startDate, endDate) {
         .enter()
         .append('g')
           .attr('class', 'legend')
-          .attr('transform', (d, i) => `translate(${width + 20},${i * 25})`);
+          .attr('transform', (d, i) => isNarrow
+            ? `translate(${(i % 2) * (width / 2)},${height + margin.bottom + 12 + Math.floor(i / 2) * 24})`
+            : `translate(${width + 20},${i * 25})`);
 
       legend.append('rect')
         .attr('x', 0)
@@ -672,7 +663,7 @@ async function loadPapersByDateRange(startDate, endDate) {
       legend.append('text')
         .attr('x', 28)
         .attr('y', 13)
-        .text(d => d.keyword)
+        .text(d => (isNarrow && d.keyword.length > 16) ? d.keyword.slice(0, 15) + '…' : d.keyword)
         .style('font-size', '12px')
         .style('alignment-baseline', 'middle');
 
