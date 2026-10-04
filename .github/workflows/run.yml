@@ -10,6 +10,9 @@ on:
     - cron: "15 12 * * 1-5"
     - cron: "15 16 * * 1-5"
     - cron: "15 21 * * 1-5"
+    - cron: "15 2 * * 0,6"
+    - cron: "15 12 * * 0,6"
+    - cron: "15 21 * * 0,6"
   workflow_dispatch:
     inputs:
       process_date:
@@ -66,8 +69,26 @@ jobs:
           today="$requested_date"
         elif [ "${{ github.event_name }}" = "schedule" ]; then
           scheduled_cron="${{ github.event.schedule }}"
-          today=$(python daily_arxiv/schedule_date.py "$scheduled_cron")
-          echo "定时槽位 $scheduled_cron 对应处理日期 $today / Scheduled slot $scheduled_cron resolves to $today"
+          schedule_day_field=$(printf '%s' "$scheduled_cron" | awk '{print $NF}')
+          if [ "$schedule_day_field" != "1-5" ]; then
+            sweep_lookback_days="${{ vars.SWEEP_LOOKBACK_DAYS }}"
+            if [ -z "$sweep_lookback_days" ]; then sweep_lookback_days="7"; fi
+            echo "周末回扫槽位 $scheduled_cron，扫描近 $sweep_lookback_days 天 / Weekend sweep slot $scheduled_cron, scanning the last $sweep_lookback_days days"
+            today=$(python daily_arxiv/pick_backlog_date.py data \
+              --lookback-days "$sweep_lookback_days" \
+              --language "$language" \
+              --input-source "$ai_input_source") || exit 1
+            if [ -z "$today" ]; then
+              echo "周末回扫：近 $sweep_lookback_days 天没有未完成日期，跳过本次运行 / Weekend sweep: no incomplete dates in the last $sweep_lookback_days days; skipping this run"
+              echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=sweep_no_backlog" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "周末回扫选中未完成日期 $today / Weekend sweep picked incomplete date $today"
+          else
+            today=$(python daily_arxiv/schedule_date.py "$scheduled_cron")
+            echo "定时槽位 $scheduled_cron 对应处理日期 $today / Scheduled slot $scheduled_cron resolves to $today"
+          fi
         else
           today="$current_utc_date"
         fi
@@ -553,6 +574,9 @@ jobs:
               ;;
             "already_completed")
               echo "ℹ️ 工作流完成：当天数据已完整，无需重复处理 / Workflow completed: Today's data is already complete"
+              ;;
+            "sweep_no_backlog")
+              echo "ℹ️ 工作流完成：周末回扫未发现未完成日期 / Workflow completed: Weekend sweep found no incomplete dates"
               ;;
             "processing_error")
               echo "⚠️ 工作流完成：爬取处理出错 / Workflow completed: Crawl processing error"
