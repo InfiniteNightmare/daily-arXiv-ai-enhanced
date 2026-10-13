@@ -5,6 +5,9 @@ name: arXiv-daily-ai-enhanced
 
 on:
   schedule:
+    # Slots aligned to the LLM provider quota windows (Beijing 0/5/10/15/20 =
+    # UTC 16/21/02/07/12). Pushing this file re-registers the timers, which
+    # occasionally go silent on GitHub's side; keep this comment on re-push.
     - cron: "15 2 * * 1-5"
     - cron: "15 7 * * 1-5"
     - cron: "15 12 * * 1-5"
