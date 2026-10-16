@@ -88,6 +88,8 @@ The scheduled workflow runs five times per weekday at `02:15`, `07:15`, `12:15`,
 | `AI_MAX_SECONDS` | `0` | AI-stage time budget. `0` means no application-level time budget. |
 | `AI_CHECKPOINT_ENABLED` | `true` | Periodically saves partial AI results to the `data` branch. |
 | `AI_CHECKPOINT_INTERVAL_SECONDS` | `600` | Checkpoint interval. The workflow also attempts one final checkpoint when it receives a termination signal. |
+| `AI_DISABLE_THINKING` | `true` | Sends `extra_body={"thinking": {"type": "disabled"}}` with every AI request. Keep enabled for thinking-capable OpenAI-compatible providers; set to `false` if the provider rejects the extra parameter. |
+| `AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS` | `60` | Minimum interval between local AI checkpoint flushes. `0` flushes after every paper. Interrupted runs re-process the last interval's papers as deferred items. |
 | `SENSITIVE_CHECK_ENABLED` | `false` | Enables the optional sensitive-word check. Disabled by default. |
 | `SWEEP_LOOKBACK_DAYS` | `7` | How many recent UTC days the backlog sweep scans, including today. Applies to weekend sweeps and to weekday slots whose own date is already complete. |
 

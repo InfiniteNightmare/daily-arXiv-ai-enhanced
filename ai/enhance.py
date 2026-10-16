@@ -88,7 +88,7 @@ def get_env_float(name: str, default: float, min_value: float = 0.0) -> float:
 
 def get_env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
-    if value is None:
+    if value is None or not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -115,6 +115,10 @@ AI_FULL_TEXT_RETRY_MAX_SECONDS = get_env_float("AI_FULL_TEXT_RETRY_MAX_SECONDS",
 AI_FULL_TEXT_MIN_INTERVAL_SECONDS = get_env_float("AI_FULL_TEXT_MIN_INTERVAL_SECONDS", 0.5)
 AI_FULL_TEXT_MAX_CHARS = get_env_int("AI_FULL_TEXT_MAX_CHARS", 0, min_value=0)
 AI_FULL_TEXT_MIN_CHARS = get_env_int("AI_FULL_TEXT_MIN_CHARS", 2000, min_value=0)
+AI_DISABLE_THINKING = get_env_bool("AI_DISABLE_THINKING", True)
+AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS = get_env_float(
+    "AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS", 60.0, min_value=0.0
+)
 
 SENSITIVE_CHECK_ENABLED = get_env_bool("SENSITIVE_CHECK_ENABLED", False)
 SENSITIVE_CHECK_RETRY_ATTEMPTS = get_env_int("SENSITIVE_CHECK_RETRY_ATTEMPTS", 2, min_value=1)
@@ -722,12 +726,26 @@ def parse_args():
     return parser.parse_args()
 
 
+def build_chat_openai_kwargs(model_name: str) -> Dict:
+    """ChatOpenAI settings; the thinking toggle keeps today's default behavior.
+
+    The extra_body thinking switch is provider-specific, so it stays
+    configurable: AI_DISABLE_THINKING=false drops it for providers that
+    reject unknown parameters.
+    """
+    kwargs = {
+        "model": model_name,
+        "timeout": AI_REQUEST_TIMEOUT_SECONDS,
+        "max_retries": AI_SDK_MAX_RETRIES,
+    }
+    if AI_DISABLE_THINKING:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    return kwargs
+
+
 def build_chain(model_name: str):
     llm = ChatOpenAI(
-        model=model_name,
-        timeout=AI_REQUEST_TIMEOUT_SECONDS,
-        max_retries=AI_SDK_MAX_RETRIES,
-        extra_body={"thinking": {"type": "disabled"}},
+        **build_chat_openai_kwargs(model_name),
     ).with_structured_output(Structure, method="function_calling")
 
     prompt_template = ChatPromptTemplate.from_messages([
@@ -940,6 +958,28 @@ def save_checkpoint(target_file: str, ordered_data: List[Dict], processed_by_id:
     log_status(f"AI checkpoint saved: {written}/{len(ordered_data)} rows -> {target_path.name}")
 
 
+class CheckpointThrottle:
+    """Rate-limit local checkpoint flushes to avoid O(n^2) full-file rewrites.
+
+    Rows finished inside the interval live only in memory; an interrupted run
+    loses at most one interval of progress, which the next run re-processes
+    as deferred items. An interval of 0 flushes after every paper.
+    """
+
+    def __init__(self, interval_seconds: float):
+        self.interval_seconds = interval_seconds
+        self.last_saved_at = 0.0
+
+    def should_save(self) -> bool:
+        if self.interval_seconds <= 0:
+            return True
+        now = time.monotonic()
+        if now - self.last_saved_at >= self.interval_seconds:
+            self.last_saved_at = now
+            return True
+        return False
+
+
 def ordered_processed_rows(data: List[Dict], processed_by_id: Dict) -> List[Dict]:
     return [
         processed_by_id[item["id"]]
@@ -989,6 +1029,7 @@ def process_all_items(
         return ordered_processed_rows(data, checkpoint_by_id)
 
     if AI_MAX_SECONDS > 0:
+        checkpoint_saver = CheckpointThrottle(AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS)
         started_at = time.monotonic()
         processed_count = 0
         for item in progress_iter(pending_data, total=len(pending_data), desc="Processing items"):
@@ -1002,7 +1043,8 @@ def process_all_items(
                 )
                 processed_by_id[item_id] = result
                 checkpoint_by_id[item_id] = result
-                save_checkpoint(target_file, data, checkpoint_by_id)
+                if checkpoint_saver.should_save():
+                    save_checkpoint(target_file, data, checkpoint_by_id)
                 continue
             try:
                 result = process_single_item(chain, item, language)
@@ -1023,7 +1065,8 @@ def process_all_items(
                 )
                 processed_by_id[item_id] = result
                 checkpoint_by_id[item_id] = result
-            save_checkpoint(target_file, data, checkpoint_by_id)
+            if checkpoint_saver.should_save():
+                save_checkpoint(target_file, data, checkpoint_by_id)
             processed_count += 1
             log_ci_progress(
                 len(processed_by_id),
@@ -1035,6 +1078,7 @@ def process_all_items(
         return ordered_processed_rows(data, checkpoint_by_id)
     
     # 使用线程池并行处理
+    checkpoint_saver = CheckpointThrottle(AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS)
     started_at = time.monotonic()
     processed_count = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1077,7 +1121,8 @@ def process_all_items(
                 )
                 processed_by_id[item_id] = result
                 checkpoint_by_id[item_id] = result
-            save_checkpoint(target_file, data, checkpoint_by_id)
+            if checkpoint_saver.should_save():
+                save_checkpoint(target_file, data, checkpoint_by_id)
             processed_count += 1
             log_ci_progress(
                 len(processed_by_id),
@@ -1100,6 +1145,8 @@ def main():
     data = []
     with open(args.data, "r") as f:
         for line in f:
+            if not line.strip():
+                continue
             data.append(json.loads(line))
 
     # 去重

@@ -334,6 +334,8 @@ jobs:
         ai_full_text_min_chars="${{ vars.AI_FULL_TEXT_MIN_CHARS }}"
         ai_checkpoint_enabled="${{ vars.AI_CHECKPOINT_ENABLED }}"
         ai_checkpoint_interval_seconds="${{ vars.AI_CHECKPOINT_INTERVAL_SECONDS }}"
+        ai_disable_thinking="${{ vars.AI_DISABLE_THINKING }}"
+        ai_local_checkpoint_interval_seconds="${{ vars.AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS }}"
         if [ -z "$language" ]; then language="Chinese"; fi
         if [ -z "$model_name" ]; then model_name="deepseek-chat"; fi
         if [ -z "$ai_max_workers" ]; then ai_max_workers="1"; fi
@@ -356,6 +358,11 @@ jobs:
         if [ -z "$ai_checkpoint_interval_seconds" ]; then ai_checkpoint_interval_seconds="600"; fi
         if ! [[ "$ai_checkpoint_interval_seconds" =~ ^[0-9]+$ ]] || [ "$ai_checkpoint_interval_seconds" -lt 30 ]; then
           ai_checkpoint_interval_seconds="600"
+        fi
+        if [ -z "$ai_disable_thinking" ]; then ai_disable_thinking="true"; fi
+        if [ -z "$ai_local_checkpoint_interval_seconds" ]; then ai_local_checkpoint_interval_seconds="60"; fi
+        if ! [[ "$ai_local_checkpoint_interval_seconds" =~ ^[0-9]+$ ]]; then
+          ai_local_checkpoint_interval_seconds="60"
         fi
         echo "开始AI增强处理... / Starting AI enhancement processing..."
 
@@ -381,6 +388,10 @@ jobs:
         export AI_FULL_TEXT_RETRY_BASE_SECONDS="$ai_full_text_retry_base_seconds"
         export AI_FULL_TEXT_RETRY_MAX_SECONDS="$ai_full_text_retry_max_seconds"
         export AI_FULL_TEXT_MIN_CHARS="$ai_full_text_min_chars"
+        export AI_CHECKPOINT_ENABLED="$ai_checkpoint_enabled"
+        export AI_CHECKPOINT_INTERVAL_SECONDS="$ai_checkpoint_interval_seconds"
+        export AI_DISABLE_THINKING="$ai_disable_thinking"
+        export AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS="$ai_local_checkpoint_interval_seconds"
         export SENSITIVE_CHECK_ENABLED="${{ vars.SENSITIVE_CHECK_ENABLED }}"
 
         RAW_FILE="$GITHUB_WORKSPACE/data/${today}.jsonl"
