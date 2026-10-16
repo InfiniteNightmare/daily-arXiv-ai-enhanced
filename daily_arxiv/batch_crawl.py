@@ -3,9 +3,10 @@ import argparse
 import json
 import os
 import re
+import statistics
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List
 
@@ -32,11 +33,16 @@ from stream_crawl_enhance import (
 EXIT_NO_NEW_CONTENT = 1
 EXIT_PROCESSING_ERROR = 2
 EXIT_DEFERRED = 3
+EXIT_LOW_CAPTURE = 4
 ARXIV_ABS_URL_TEMPLATE = "https://arxiv.org/abs/{paper_id}"
 ARXIV_LIST_URL_TEMPLATE = "https://arxiv.org/list/{category}/new"
 
 
 class CrawlDeferred(RuntimeError):
+    pass
+
+
+class LowCaptureDeferred(RuntimeError):
     pass
 
 
@@ -77,6 +83,9 @@ def parse_args():
     parser.add_argument("--list-retries", type=int, default=env_int("ARXIV_LIST_RETRY_ATTEMPTS", 5))
     parser.add_argument("--list-timeout", type=float, default=env_float("ARXIV_LIST_TIMEOUT_SECONDS", 30.0))
     parser.add_argument("--metadata-max-seconds", type=float, default=env_float("ARXIV_METADATA_MAX_SECONDS", 0.0))
+    parser.add_argument("--low-capture-zero-fraction", type=float, default=env_float("ARXIV_LOW_CAPTURE_ZERO_FRACTION", 0.5))
+    parser.add_argument("--low-capture-fraction", type=float, default=env_float("ARXIV_LOW_CAPTURE_FRACTION", 0.4))
+    parser.add_argument("--low-capture-max-attempts", type=int, default=env_int("ARXIV_LOW_CAPTURE_MAX_ATTEMPTS", 3))
     return parser.parse_args()
 
 
@@ -90,6 +99,79 @@ def pending_seed_path(output_dir: Path, target_date: str) -> Path:
 
 def pending_metadata_path(output_dir: Path, target_date: str) -> Path:
     return output_dir / "_pending" / f"{target_date}.metadata.jsonl"
+
+
+def low_capture_marker_path(output_dir: Path, target_date: str) -> Path:
+    return output_dir / "_pending" / f"{target_date}.low-capture.json"
+
+
+def read_low_capture_attempts(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    try:
+        return int(json.loads(path.read_text(encoding="utf-8")).get("attempts", 0))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return 0
+
+
+def write_low_capture_marker(path: Path, attempts: int, candidate_count: int):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"attempts": attempts, "last_count": candidate_count}),
+        encoding="utf-8",
+    )
+
+
+def clear_low_capture_marker(path: Path):
+    if path.exists():
+        path.unlink()
+        print(f"Cleared low-capture marker: {path}", file=sys.stderr)
+
+
+def history_raw_counts(output_dir: Path, target_date: str, history_days: int) -> List[int]:
+    target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+    counts = []
+    for offset in range(1, history_days + 1):
+        date_str = (target_dt - timedelta(days=offset)).strftime("%Y-%m-%d")
+        path = output_dir / f"{date_str}.jsonl"
+        if not path.is_file():
+            continue
+        with path.open("r", encoding="utf-8") as stream:
+            count = sum(1 for line in stream if line.strip())
+        if count:
+            counts.append(count)
+    return counts
+
+
+def is_low_capture(
+    category_counts: List[int],
+    history_counts: List[int],
+    *,
+    zero_fraction_threshold: float,
+    total_fraction_threshold: float,
+) -> bool:
+    """Detect a crawl that hit stale or partially-announced /new pages.
+
+    Real failure signature (e.g. 2026-10-15): most categories return zero
+    parseable entries while a few already refreshed, so the day's capture is
+    a small fraction of the recent norm. Zero total means no announcement
+    happened at all and is handled by the no-new-content exit path.
+    """
+    if not category_counts:
+        return False
+    total = sum(category_counts)
+    if total <= 0:
+        return False
+    zero_fraction = (
+        sum(1 for count in category_counts if count <= 0) / len(category_counts)
+    )
+    if zero_fraction >= zero_fraction_threshold:
+        return True
+    if history_counts:
+        median = statistics.median(history_counts)
+        if median > 0 and total < total_fraction_threshold * median:
+            return True
+    return False
 
 
 def read_jsonl(path: Path) -> List[Dict]:
@@ -225,9 +307,10 @@ def crawl_seed_papers_with_budget(
     list_timeout: float,
     started_at: float,
     max_seconds: float,
-) -> List[Dict]:
+) -> tuple[List[Dict], List[int]]:
     session = requests.Session()
     seeds = []
+    category_counts = []
 
     for category in categories:
         url = ARXIV_LIST_URL_TEMPLATE.format(category=category)
@@ -242,6 +325,7 @@ def crawl_seed_papers_with_budget(
                     timeout_with_budget(list_timeout, started_at, max_seconds),
                 )
                 category_seeds = parse_list_page(response.text, categories)
+                category_counts.append(len(category_seeds))
                 print(f"Found {len(category_seeds)} candidate papers from {category}", file=sys.stderr)
                 seeds.extend(category_seeds)
                 break
@@ -258,7 +342,7 @@ def crawl_seed_papers_with_budget(
                 sleep_with_budget(delay, started_at, max_seconds)
                 attempt += 1
 
-    return seeds
+    return seeds, category_counts
 
 
 def parse_abs_page_metadata(seed: Dict, html: str, target_categories: List[str]) -> Dict:
@@ -416,15 +500,17 @@ def crawl_raw(args) -> int:
     started_at = time.monotonic()
     history_ids = load_history_ids(output_dir, args.date, args.history_days)
     print(f"Loaded {len(history_ids)} history IDs for deduplication", file=sys.stderr)
+    history_counts = history_raw_counts(output_dir, args.date, args.history_days)
 
     if pending_path.exists():
         unique_seeds = read_jsonl(pending_path)
         for seed in unique_seeds:
             seed["categories"] = ordered_target_categories(seed.get("categories", []), categories)
         print(f"Loaded pending seeds={len(unique_seeds)} from {pending_path}", file=sys.stderr)
+        category_counts = []
     else:
         try:
-            seeds = crawl_seed_papers_with_budget(
+            seeds, category_counts = crawl_seed_papers_with_budget(
                 categories,
                 args.list_timeout,
                 started_at,
@@ -452,7 +538,31 @@ def crawl_raw(args) -> int:
             f"Candidates={len(seeds)}, new_after_dedup={len(unique_seeds)}, duplicates={duplicate_count}",
             file=sys.stderr,
         )
+
+        marker_path = low_capture_marker_path(output_dir, args.date)
         if unique_seeds:
+            if is_low_capture(
+                category_counts,
+                history_counts,
+                zero_fraction_threshold=args.low_capture_zero_fraction,
+                total_fraction_threshold=args.low_capture_fraction,
+            ):
+                attempts = read_low_capture_attempts(marker_path) + 1
+                median = statistics.median(history_counts) if history_counts else 0
+                if attempts < args.low_capture_max_attempts:
+                    write_low_capture_marker(marker_path, attempts, len(unique_seeds))
+                    raise LowCaptureDeferred(
+                        f"suspiciously low capture: {len(unique_seeds)} papers from "
+                        f"{sum(1 for count in category_counts if count > 0)}/{len(category_counts)} "
+                        f"categories vs history median {median:.0f}; raw not written, "
+                        f"next scheduled run will re-crawl (attempt {attempts}/{args.low_capture_max_attempts})"
+                    )
+                print(
+                    f"Low-capture count has not recovered after {attempts} attempts; "
+                    "accepting it as the real listing",
+                    file=sys.stderr,
+                )
+            clear_low_capture_marker(marker_path)
             checkpoint_pending_seeds(pending_path, unique_seeds)
 
     if not unique_seeds:
@@ -515,6 +625,9 @@ def main():
     args = parse_args()
     try:
         exit_code = crawl_raw(args)
+    except LowCaptureDeferred as exc:
+        print(f"Batch crawl low-capture defer: {exc}", file=sys.stderr)
+        sys.exit(EXIT_LOW_CAPTURE)
     except CrawlDeferred as exc:
         print(f"Batch crawl deferred: {exc}", file=sys.stderr)
         sys.exit(EXIT_DEFERRED)

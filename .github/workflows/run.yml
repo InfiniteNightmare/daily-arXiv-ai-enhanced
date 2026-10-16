@@ -155,6 +155,9 @@ jobs:
         export ARXIV_API_DELAY_SECONDS="$arxiv_api_delay_seconds"
         export ARXIV_API_NUM_RETRIES="$arxiv_api_num_retries"
         export ARXIV_METADATA_MAX_SECONDS="$arxiv_metadata_max_seconds"
+        export ARXIV_LOW_CAPTURE_ZERO_FRACTION="${{ vars.ARXIV_LOW_CAPTURE_ZERO_FRACTION }}"
+        export ARXIV_LOW_CAPTURE_FRACTION="${{ vars.ARXIV_LOW_CAPTURE_FRACTION }}"
+        export ARXIV_LOW_CAPTURE_MAX_ATTEMPTS="${{ vars.ARXIV_LOW_CAPTURE_MAX_ATTEMPTS }}"
 
         if [ -s "$raw_file" ]; then
           echo "发现已存在的原始数据，跳过重新爬取 / Found existing raw data, skipping crawl"
@@ -198,6 +201,13 @@ jobs:
               fi
               exit 0
               ;;
+            4)
+              echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=low_capture_deferred" >> "$GITHUB_OUTPUT"
+              echo "persist_state=true" >> "$GITHUB_OUTPUT"
+              echo "当日爬取计数异常偏低（疑似 /new 未刷新或通告未完全上线），不写入 raw，等待下一槽位重爬 / Suspiciously low capture; raw not written, next slot will re-crawl"
+              exit 0
+              ;;
             *)
               echo "has_new_content=false" >> "$GITHUB_OUTPUT"
               echo "skip_reason=processing_error" >> "$GITHUB_OUTPUT"
@@ -220,7 +230,8 @@ jobs:
         today=${{ steps.crawl_step.outputs.crawl_date }}
         pending_file="data/_pending/${today}.jsonl"
         pending_metadata_file="data/_pending/${today}.metadata.jsonl"
-        if [ ! -s "$pending_file" ] && [ ! -s "$pending_metadata_file" ]; then
+        low_capture_marker="data/_pending/${today}.low-capture.json"
+        if [ ! -s "$pending_file" ] && [ ! -s "$pending_metadata_file" ] && [ ! -s "$low_capture_marker" ]; then
           echo "没有可持久化的 pending crawl 文件 / No pending crawl files to persist"
           exit 0
         fi
@@ -231,6 +242,7 @@ jobs:
         mkdir -p /tmp/crawl_state/data/_pending
         cp "$pending_file" "/tmp/crawl_state/data/_pending/${today}.jsonl" 2>/dev/null || true
         cp "$pending_metadata_file" "/tmp/crawl_state/data/_pending/${today}.metadata.jsonl" 2>/dev/null || true
+        cp "$low_capture_marker" "/tmp/crawl_state/data/_pending/${today}.low-capture.json" 2>/dev/null || true
         git reset -- data assets/file-list.txt 2>/dev/null || true
         rm -rf data 2>/dev/null || true
         rm -f assets/file-list.txt 2>/dev/null || true
@@ -252,7 +264,8 @@ jobs:
         mkdir -p data/_pending
         cp "/tmp/crawl_state/data/_pending/${today}.jsonl" "$pending_file" 2>/dev/null || true
         cp "/tmp/crawl_state/data/_pending/${today}.metadata.jsonl" "$pending_metadata_file" 2>/dev/null || true
-        git add "$pending_file" "$pending_metadata_file" 2>/dev/null || true
+        cp "/tmp/crawl_state/data/_pending/${today}.low-capture.json" "$low_capture_marker" 2>/dev/null || true
+        git add "$pending_file" "$pending_metadata_file" "$low_capture_marker" 2>/dev/null || true
 
         if git diff --staged --quiet; then
           echo "pending 状态没有变化 / Pending state unchanged"
@@ -607,6 +620,9 @@ jobs:
             "sweep_no_backlog")
               echo "ℹ️ 工作流完成：周末回扫未发现未完成日期 / Workflow completed: Weekend sweep found no incomplete dates"
               ;;
+            "low_capture_deferred")
+              echo "ℹ️ 工作流完成：当日爬取计数异常偏低，已延迟到下一槽位重爬 / Workflow completed: Suspiciously low capture deferred to the next slot"
+              ;;
             "processing_error")
               echo "⚠️ 工作流完成：爬取处理出错 / Workflow completed: Crawl processing error"
               ;;
@@ -761,6 +777,7 @@ jobs:
         cp /tmp/data_files/assets/file-list.txt assets/ 2>/dev/null || true
         rm -f "data/_pending/${today}.jsonl" 2>/dev/null || true
         rm -f "data/_pending/${today}.metadata.jsonl" 2>/dev/null || true
+        rm -f "data/_pending/${today}.low-capture.json" 2>/dev/null || true
         
         # 只添加数据文件 / Only add data files
         git add data/* 2>/dev/null || true
