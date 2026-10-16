@@ -1,0 +1,36 @@
+# One-off runner image verification: toolchain + test suite + data-branch
+# access on an arbitrary runner label. Dispatch before switching the pinned
+# runner in run.yml, e.g.:
+#   gh workflow run runner-probe.yml -R <repo> --ref main -f runner=ubuntu-26.04
+name: runner-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label to probe (e.g. ubuntu-26.04)"
+        required: false
+        type: string
+        default: "ubuntu-26.04"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04' }}
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Probe toolchain and tests on this runner image
+      run: |
+        grep PRETTY_NAME /etc/os-release
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        uv sync
+        uv run --no-sync python -c \
+          "import requests, scrapy, langchain_openai, dotenv, tqdm; print('imports OK')"
+        uv run --no-sync python -m unittest discover -s tests 2>&1 | tail -3
+        git fetch origin data
+        git show "origin/data:data/2026-10-16.jsonl" | wc -l
+        echo "runner-probe completed on ${{ inputs.runner || 'ubuntu-26.04' }}"
