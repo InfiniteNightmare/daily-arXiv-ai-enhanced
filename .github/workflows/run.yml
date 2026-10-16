@@ -68,6 +68,7 @@ jobs:
         git fetch origin +refs/heads/data:refs/remotes/origin/data || true
         git checkout origin/data -- data assets/file-list.txt 2>/dev/null || true
 
+        weekday_backlog_fallback=false
         if [ -n "$requested_date" ]; then
           today="$requested_date"
         elif [ "${{ github.event_name }}" = "schedule" ]; then
@@ -91,18 +92,11 @@ jobs:
           else
             today=$(python daily_arxiv/schedule_date.py "$scheduled_cron")
             echo "定时槽位 $scheduled_cron 对应处理日期 $today / Scheduled slot $scheduled_cron resolves to $today"
+            weekday_backlog_fallback=true
           fi
         else
           today="$current_utc_date"
         fi
-
-        echo "crawl_date=$today" >> "$GITHUB_OUTPUT"
-
-        if [[ ! "$today" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-          echo "Invalid process_date: $today. Expected YYYY-MM-DD."
-          exit 1
-        fi
-        echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
 
         raw_file="data/${today}.jsonl"
         ai_file="data/${today}_AI_enhanced_${language}.jsonl"
@@ -116,12 +110,44 @@ jobs:
             "$raw_file" "$ai_file" --input-source "$ai_input_source"
         }
 
+        # 工作日槽位当天已完整时，本窗口回扫近期缺口最大的未完成日期，
+        # 避免空置配额窗口；仍是一次运行只处理一个日期。
+        # Weekday quota windows fall back to the backlog sweep once the slot's
+        # own date is complete, so a fresh window is never left idle.
         if is_day_complete; then
-          echo "当天数据已完整，跳过本次运行 / Today's data is already complete; skipping this run"
-          echo "has_new_content=false" >> "$GITHUB_OUTPUT"
-          echo "skip_reason=already_completed" >> "$GITHUB_OUTPUT"
-          exit 0
+          if [ "$weekday_backlog_fallback" != "true" ]; then
+            echo "当天数据已完整，跳过本次运行 / Today's data is already complete; skipping this run"
+            echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=already_completed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sweep_lookback_days="${{ vars.SWEEP_LOOKBACK_DAYS }}"
+          if [ -z "$sweep_lookback_days" ]; then sweep_lookback_days="7"; fi
+          backlog_date=$(python daily_arxiv/pick_backlog_date.py data \
+            --lookback-days "$sweep_lookback_days" \
+            --language "$language" \
+            --input-source "$ai_input_source") || exit 1
+          if [ -n "$backlog_date" ] && [ "$backlog_date" != "$today" ]; then
+            echo "当天数据已完整，本槽位回扫处理未完成日期 $backlog_date / Today's data is complete; this slot sweeps the earlier incomplete date $backlog_date"
+            today="$backlog_date"
+            raw_file="data/${today}.jsonl"
+            ai_file="data/${today}_AI_enhanced_${language}.jsonl"
+            md_file="data/${today}.md"
+          else
+            echo "当天数据已完整，近 $sweep_lookback_days 天没有其他未完成日期，跳过本次运行 / Today's data is already complete and no other incomplete dates within the last $sweep_lookback_days days; skipping this run"
+            echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=already_completed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
         fi
+
+        echo "crawl_date=$today" >> "$GITHUB_OUTPUT"
+
+        if [[ ! "$today" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+          echo "Invalid process_date: $today. Expected YYYY-MM-DD."
+          exit 1
+        fi
+        echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
 
         export TOKEN_GITHUB=${{ secrets.TOKEN_GITHUB }}
         export CATEGORIES="$categories"
