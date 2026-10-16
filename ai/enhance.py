@@ -138,6 +138,18 @@ def short_error(exc: Exception, limit: int = 500) -> str:
     return message[:limit]
 
 
+def normalize_repo_name(repo: str) -> str:
+    """Trim URL punctuation and a trailing .git suffix from a repo name.
+
+    rstrip treats its argument as a character set, so rstrip(".git") would also
+    eat trailing g/i/t letters of legitimate repo names ("vit" -> "").
+    """
+    repo = repo.rstrip(".,)")
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    return repo
+
+
 def log_status(message: str):
     if CI_LOGS:
         print(message, file=sys.stderr, flush=True)
@@ -738,7 +750,7 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         if match:
             owner, repo = match.groups()
             # 清理 repo 名称，去掉可能的 .git 后缀或末尾的标点
-            repo = repo.rstrip(".git").rstrip(".,)")
+            repo = normalize_repo_name(repo)
             
             full_url = f"https://github.com/{owner}/{repo}"
             code_info["code_url"] = full_url
