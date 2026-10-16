@@ -58,6 +58,101 @@ def fake_metadata(session, batch, *args, **kwargs):
     ]
 
 
+RECENT_HTML = """
+<div id='dlpage'>
+<ul> <li><a href="/list/cs.AI/recent?skip=0&amp;show=50">Fri, 16 Oct 2026</a></li>
+<li><a href="/list/cs.AI/recent?skip=22&amp;show=50">Thu, 15 Oct 2026</a></li></ul>
+<dl id='articles'>
+<h3>Fri, 16 Oct 2026 (showing 22 of 22 entries )</h3><dt>item 1</dt>
+<h3>Thu, 15 Oct 2026 (showing 5 of 5 entries )</h3><dt>item 2</dt>
+</dl></div>
+"""
+
+
+class TestRecentSectionParsing(unittest.TestCase):
+    def test_section_label_format(self):
+        self.assertEqual(batch_crawl.recent_section_label("2026-10-16"), "Fri, 16 Oct 2026")
+        # Single-digit days must not be zero-padded (arXiv uses "Mon, 2 Nov").
+        self.assertEqual(batch_crawl.recent_section_label("2026-11-02"), "Mon, 2 Nov 2026")
+
+    def test_parse_recent_page_top_and_lower_section(self):
+        total, top = batch_crawl.parse_recent_page(RECENT_HTML, "Fri, 16 Oct 2026")
+        self.assertEqual(total, 22)
+        self.assertEqual(top, "2026-10-16")
+        total, top = batch_crawl.parse_recent_page(RECENT_HTML, "Thu, 15 Oct 2026")
+        self.assertEqual(total, 5)
+        self.assertEqual(top, "2026-10-16")
+
+    def test_parse_recent_page_absent_target(self):
+        total, top = batch_crawl.parse_recent_page(RECENT_HTML, "Wed, 14 Oct 2026")
+        self.assertIsNone(total)
+        self.assertEqual(top, "2026-10-16")
+
+    def test_parse_recent_section_date(self):
+        self.assertEqual(
+            batch_crawl.parse_recent_section_date("Fri, 16 Oct 2026"), "2026-10-16"
+        )
+        self.assertIsNone(batch_crawl.parse_recent_section_date("not a date"))
+
+
+class TestCaptureInconsistencies(unittest.TestCase):
+    TARGET = "2026-10-15"
+    TOPS = {"cs.AI": "2026-10-15", "cs.CL": "2026-10-15"}
+
+    def test_rule_a_new_stale_category(self):
+        # The 2026-10-15 signature: /recent has the day's section but /new
+        # parsed zero candidates for the category.
+        issues = batch_crawl.capture_inconsistencies(
+            ["cs.AI", "cs.CL"], [0, 17], {"cs.AI": 286, "cs.CL": 177}, self.TOPS, self.TARGET
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertIn("cs.AI", issues[0])
+        self.assertIn("286", issues[0])
+
+    def test_rule_b_new_ahead_of_recent(self):
+        issues = batch_crawl.capture_inconsistencies(
+            ["cs.AI", "cs.CL"], [5, 17], {"cs.AI": None, "cs.CL": 40}, self.TOPS, self.TARGET
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertIn("cs.AI", issues[0])
+        self.assertIn("no section", issues[0])
+
+    def test_rule_c_recent_top_is_a_different_day(self):
+        issues = batch_crawl.capture_inconsistencies(
+            ["cs.AI", "cs.CL"],
+            [10, 10],
+            {"cs.AI": 100, "cs.CL": 50},
+            {"cs.AI": "2026-10-16", "cs.CL": "2026-10-15"},
+            self.TARGET,
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertIn("2026-10-16", issues[0])
+
+    def test_steady_state_friday_is_clean(self):
+        categories = [
+            "cs.DB", "cs.AI", "cs.DC", "cs.SE", "cs.LG", "cs.MA",
+            "cs.OS", "cs.CL", "cs.CY", "cs.IR", "cs.DS",
+        ]
+        counts = [6, 224, 14, 22, 223, 18, 3, 165, 6, 14, 18]
+        totals = {
+            "cs.DB": 6, "cs.AI": 286, "cs.DC": 16, "cs.SE": 25, "cs.LG": 306,
+            "cs.MA": 22, "cs.OS": 3, "cs.CL": 177, "cs.CY": 8, "cs.IR": 14,
+            "cs.DS": 21,
+        }
+        tops = {category: "2026-10-16" for category in categories}
+        issues = batch_crawl.capture_inconsistencies(
+            categories, counts, totals, tops, "2026-10-16"
+        )
+        self.assertEqual(issues, [])
+
+    def test_unverifiable_categories_are_skipped(self):
+        # cs.AI's /recent page could not be fetched: no evidence, no verdict.
+        issues = batch_crawl.capture_inconsistencies(
+            ["cs.AI", "cs.CL"], [0, 17], {"cs.CL": 177}, {"cs.CL": self.TARGET}, self.TARGET
+        )
+        self.assertEqual(issues, [])
+
+
 class TestIsLowCapture(unittest.TestCase):
     def test_stale_new_page_signature_triggers(self):
         # 2026-10-15: 10 of 11 categories returned zero parseable entries.
@@ -153,19 +248,28 @@ class TestLowCaptureMarker(unittest.TestCase):
 
 
 class TestCrawlRawLowCaptureFlow(unittest.TestCase):
-    def run_crawl_with_stale_listing(self, output_dir: Path):
+    def run_crawl(self, output_dir: Path, seed_counts=None, recent_report=None):
         args = make_args(output_dir)
+        if recent_report is None:
+            # Steady-state-like report: both categories have today's section.
+            recent_report = (
+                {"cs.AI": 286, "cs.CL": 177},
+                {"cs.AI": "2026-10-15", "cs.CL": "2026-10-15"},
+            )
         with mock.patch.object(
             batch_crawl,
             "crawl_seed_papers_with_budget",
-            return_value=(fake_seeds(17), [0, 17]),
+            return_value=(fake_seeds(17), seed_counts or [0, 17]),
         ) as seed_fetch, mock.patch.object(
             batch_crawl, "load_history_ids", return_value=set()
         ), mock.patch.object(
             batch_crawl, "resilient_metadata_batch", side_effect=fake_metadata
-        ):
+        ), mock.patch.object(
+            batch_crawl, "fetch_recent_report", return_value=recent_report
+        ) as recent_fetch:
             batch_crawl.crawl_raw(args)
             seed_fetch.assert_called_once()
+            recent_fetch.assert_called_once()
 
     def test_first_low_capture_defers_without_writing_raw(self):
         with TemporaryDirectory() as tmp:
@@ -174,7 +278,7 @@ class TestCrawlRawLowCaptureFlow(unittest.TestCase):
                 '{"id": "x"}\n' * 100, encoding="utf-8"
             )
             with self.assertRaises(batch_crawl.LowCaptureDeferred):
-                self.run_crawl_with_stale_listing(output_dir)
+                self.run_crawl(output_dir)  # counts [0, 17]: rule A on cs.AI
             marker = output_dir / "_pending" / "2026-10-15.low-capture.json"
             self.assertEqual(batch_crawl.read_low_capture_attempts(marker), 1)
             # The whole point: a suspicious capture must not be locked in as raw.
@@ -192,7 +296,7 @@ class TestCrawlRawLowCaptureFlow(unittest.TestCase):
             marker = output_dir / "_pending" / "2026-10-15.low-capture.json"
             batch_crawl.write_low_capture_marker(marker, 1, 17)
             with self.assertRaises(batch_crawl.LowCaptureDeferred):
-                self.run_crawl_with_stale_listing(output_dir)
+                self.run_crawl(output_dir)
             self.assertEqual(batch_crawl.read_low_capture_attempts(marker), 2)
             self.assertFalse((output_dir / "2026-10-15.jsonl").exists())
 
@@ -204,12 +308,44 @@ class TestCrawlRawLowCaptureFlow(unittest.TestCase):
             )
             marker = output_dir / "_pending" / "2026-10-15.low-capture.json"
             batch_crawl.write_low_capture_marker(marker, 2, 17)
-            self.run_crawl_with_stale_listing(output_dir)
+            self.run_crawl(output_dir)
             raw_path = output_dir / "2026-10-15.jsonl"
             self.assertTrue(raw_path.exists())
             rows = [json.loads(line) for line in raw_path.open(encoding="utf-8")]
             self.assertEqual(len(rows), 17)
             self.assertFalse(marker.exists())
+
+    def test_recent_mismatch_alone_defers_even_without_heuristics(self):
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            # Median 30, total 22: no heuristic trigger; rule B on cs.AI only.
+            (output_dir / "2026-10-14.jsonl").write_text(
+                '{"id": "x"}\n' * 30, encoding="utf-8"
+            )
+            with self.assertRaises(batch_crawl.LowCaptureDeferred):
+                self.run_crawl(
+                    output_dir,
+                    seed_counts=[5, 17],
+                    recent_report=(
+                        {"cs.AI": None, "cs.CL": 40},
+                        {"cs.AI": "2026-10-15", "cs.CL": "2026-10-15"},
+                    ),
+                )
+            marker = output_dir / "_pending" / "2026-10-15.low-capture.json"
+            self.assertEqual(batch_crawl.read_low_capture_attempts(marker), 1)
+            self.assertFalse((output_dir / "2026-10-15.jsonl").exists())
+
+    def test_recent_unavailable_heuristic_still_guards(self):
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "2026-10-14.jsonl").write_text(
+                '{"id": "x"}\n' * 100, encoding="utf-8"
+            )
+            # /recent entirely unreachable: counts [0, 17] still defer via the
+            # heuristic backstop.
+            with self.assertRaises(batch_crawl.LowCaptureDeferred):
+                self.run_crawl(output_dir, recent_report=({}, {}))
+            self.assertFalse((output_dir / "2026-10-15.jsonl").exists())
 
     def test_healthy_capture_clears_stale_marker(self):
         with TemporaryDirectory() as tmp:
@@ -219,17 +355,15 @@ class TestCrawlRawLowCaptureFlow(unittest.TestCase):
             )
             marker = output_dir / "_pending" / "2026-10-15.low-capture.json"
             batch_crawl.write_low_capture_marker(marker, 1, 17)
-            args = make_args(output_dir)
-            with mock.patch.object(
-                batch_crawl,
-                "crawl_seed_papers_with_budget",
-                return_value=(fake_seeds(80), [60, 20]),
-            ), mock.patch.object(
-                batch_crawl, "load_history_ids", return_value=set()
-            ), mock.patch.object(
-                batch_crawl, "resilient_metadata_batch", side_effect=fake_metadata
-            ):
-                batch_crawl.crawl_raw(args)
+            # Counts [60, 20]: total 80, median 100, consistent /recent report.
+            self.run_crawl(
+                output_dir,
+                seed_counts=[60, 20],
+                recent_report=(
+                    {"cs.AI": 100, "cs.CL": 50},
+                    {"cs.AI": "2026-10-15", "cs.CL": "2026-10-15"},
+                ),
+            )
             self.assertFalse(marker.exists())
             self.assertTrue((output_dir / "2026-10-15.jsonl").exists())
 

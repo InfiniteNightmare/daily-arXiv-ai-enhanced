@@ -36,6 +36,17 @@ EXIT_DEFERRED = 3
 EXIT_LOW_CAPTURE = 4
 ARXIV_ABS_URL_TEMPLATE = "https://arxiv.org/abs/{paper_id}"
 ARXIV_LIST_URL_TEMPLATE = "https://arxiv.org/list/{category}/new"
+ARXIV_RECENT_URL_TEMPLATE = "https://arxiv.org/list/{category}/recent?skip=0&show=2000"
+WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+MONTH_LABELS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+MONTH_NAMES = {number: name for name, number in MONTH_LABELS.items()}
+RECENT_SECTION_PATTERN = re.compile(
+    r"<h3>(?P<label>[A-Za-z]{3}, \d{1,2} [A-Za-z]{3} \d{4})\s*"
+    r"\(showing \d+ of (?P<total>\d+) entries"
+)
 
 
 class CrawlDeferred(RuntimeError):
@@ -172,6 +183,131 @@ def is_low_capture(
         if median > 0 and total < total_fraction_threshold * median:
             return True
     return False
+
+
+def recent_section_label(target_date: str) -> str:
+    parsed = datetime.strptime(target_date, "%Y-%m-%d")
+    return (
+        f"{WEEKDAY_LABELS[parsed.weekday()]}, "
+        f"{parsed.day} {MONTH_NAMES[parsed.month]} {parsed.year}"
+    )
+
+
+def parse_recent_section_date(label: str) -> str | None:
+    match = re.fullmatch(r"([A-Za-z]{3}), (\d{1,2}) ([A-Za-z]{3}) (\d{4})", label)
+    if match is None:
+        return None
+    month = MONTH_LABELS.get(match.group(3))
+    if month is None:
+        return None
+    try:
+        return datetime(int(match.group(4)), month, int(match.group(2))).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def parse_recent_page(html: str, target_label: str) -> tuple[int | None, str | None]:
+    """Extract (target-date section total, top section date) from a /recent page.
+
+    Section headers look like '<h3>Fri, 16 Oct 2026 (showing 22 of 22 entries )'
+    and are ordered newest first; the target total is None when the target date
+    has no section on the page.
+    """
+    top_date = None
+    target_total = None
+    for match in RECENT_SECTION_PATTERN.finditer(html):
+        label = match.group("label")
+        if top_date is None:
+            top_date = parse_recent_section_date(label)
+        if label == target_label:
+            target_total = int(match.group("total"))
+    return target_total, top_date
+
+
+def fetch_recent_report(
+    categories: List[str],
+    target_date: str,
+    list_timeout: float,
+    started_at: float,
+    max_seconds: float,
+) -> tuple[Dict[str, int | None], Dict[str, str | None]]:
+    """Fetch each category's /recent page and locate the target-date section.
+
+    Returns per-category maps of (section total or None when absent, top
+    section date). A category whose /recent page cannot be fetched is omitted
+    from both maps so the caller treats it as unverifiable rather than
+    inconsistent. Bounded retries: this verification must never hang a crawl.
+    """
+    target_label = recent_section_label(target_date)
+    session = requests.Session()
+    totals: Dict[str, int | None] = {}
+    top_dates: Dict[str, str | None] = {}
+    for category in categories:
+        url = ARXIV_RECENT_URL_TEMPLATE.format(category=category)
+        print(f"Fetching arXiv recent list: {url}", file=sys.stderr)
+        attempt = 1
+        while attempt <= 3:
+            ensure_metadata_budget(started_at, max_seconds)
+            try:
+                response = http_get_with_timeout(
+                    session,
+                    url,
+                    timeout_with_budget(list_timeout, started_at, max_seconds),
+                )
+                total, top_date = parse_recent_page(response.text, target_label)
+                totals[category] = total
+                top_dates[category] = top_date
+                break
+            except Exception as exc:  # noqa: BLE001
+                if not enhance.is_retryable_exception(exc) or attempt >= 3:
+                    print(
+                        f"Recent list check unavailable for {category}: "
+                        f"{enhance.short_error(exc)}",
+                        file=sys.stderr,
+                    )
+                    break
+                delay = retry_delay_for_exception(attempt, 1.0, exc)
+                sleep_with_budget(delay, started_at, max_seconds)
+                attempt += 1
+    return totals, top_dates
+
+
+def capture_inconsistencies(
+    categories: List[str],
+    category_counts: List[int],
+    recent_totals: Dict[str, int | None],
+    recent_top_dates: Dict[str, str | None],
+    target_date: str,
+) -> List[str]:
+    """Cross-check /new parse results against the dated sections on /recent.
+
+    Steady state (verified): every category with a same-day /recent section
+    also yields candidates from /new, and /recent's top section matches the
+    target date. The three failure signatures below mean /new is serving
+    stale, partial, or newer-than-target content and must not be locked in.
+    """
+    issues = []
+    for category, parsed in zip(categories, category_counts):
+        if category not in recent_totals:
+            continue
+        total = recent_totals[category]
+        top_date = recent_top_dates.get(category)
+        if total is not None and total > 0 and parsed <= 0:
+            issues.append(
+                f"{category}: /recent shows {total} entries for {target_date} "
+                "but /new parsed 0 candidates"
+            )
+        elif parsed > 0 and total is None:
+            issues.append(
+                f"{category}: /new parsed {parsed} candidates but /recent has "
+                f"no section for {target_date}"
+            )
+        if parsed > 0 and top_date is not None and top_date != target_date:
+            issues.append(
+                f"{category}: /recent top section is {top_date}, not {target_date} "
+                "(/new is serving a different day's listing)"
+            )
+    return issues
 
 
 def read_jsonl(path: Path) -> List[Dict]:
@@ -541,25 +677,55 @@ def crawl_raw(args) -> int:
 
         marker_path = low_capture_marker_path(output_dir, args.date)
         if unique_seeds:
-            if is_low_capture(
+            recent_totals, recent_top_dates = fetch_recent_report(
+                categories,
+                args.date,
+                args.list_timeout,
+                started_at,
+                args.metadata_max_seconds,
+            )
+            issues = capture_inconsistencies(
+                categories,
+                category_counts,
+                recent_totals,
+                recent_top_dates,
+                args.date,
+            )
+            if issues:
+                print(
+                    f"Recent-listing verification found {len(issues)} "
+                    "inconsistent categories",
+                    file=sys.stderr,
+                )
+            heuristic = is_low_capture(
                 category_counts,
                 history_counts,
                 zero_fraction_threshold=args.low_capture_zero_fraction,
                 total_fraction_threshold=args.low_capture_fraction,
-            ):
+            )
+            if issues or heuristic:
                 attempts = read_low_capture_attempts(marker_path) + 1
                 median = statistics.median(history_counts) if history_counts else 0
                 if attempts < args.low_capture_max_attempts:
+                    if issues:
+                        reason = "; ".join(issues[:3])
+                        if len(issues) > 3:
+                            reason += f"; (+{len(issues) - 3} more categories)"
+                    else:
+                        reason = (
+                            f"suspiciously low capture: {len(unique_seeds)} papers from "
+                            f"{sum(1 for count in category_counts if count > 0)}/"
+                            f"{len(category_counts)} categories vs history median {median:.0f}"
+                        )
                     write_low_capture_marker(marker_path, attempts, len(unique_seeds))
                     raise LowCaptureDeferred(
-                        f"suspiciously low capture: {len(unique_seeds)} papers from "
-                        f"{sum(1 for count in category_counts if count > 0)}/{len(category_counts)} "
-                        f"categories vs history median {median:.0f}; raw not written, "
-                        f"next scheduled run will re-crawl (attempt {attempts}/{args.low_capture_max_attempts})"
+                        f"/new vs /recent mismatch: {reason}; raw not written, "
+                        f"next scheduled run will re-crawl "
+                        f"(attempt {attempts}/{args.low_capture_max_attempts})"
                     )
                 print(
-                    f"Low-capture count has not recovered after {attempts} attempts; "
-                    "accepting it as the real listing",
+                    f"Capture verification has not recovered after {attempts} attempts; "
+                    "accepting the capture as the real listing",
                     file=sys.stderr,
                 )
             clear_low_capture_marker(marker_path)
