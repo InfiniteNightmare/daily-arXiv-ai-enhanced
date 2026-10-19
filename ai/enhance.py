@@ -61,11 +61,17 @@ STATUS_CODE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 REQUIRED_AI_FIELDS = ["tldr", "motivation", "method", "result", "conclusion"]
+CJK_CHARACTER_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+CJK_REQUIRED_LANGUAGES = {"chinese", "zh", "zh-cn", "zh-hans", "中文", "简体中文", "汉语"}
 SENSITIVE_CHECK_URL = os.environ.get("SENSITIVE_CHECK_URL", "https://spam.dw-dengwei.workers.dev")
 
 
 class IncompleteAIResponseError(ValueError):
     """The provider returned a response that cannot be saved as a complete AI result."""
+
+
+class WrongLanguageAIResponseError(IncompleteAIResponseError):
+    """The provider returned complete fields but in the wrong language."""
 
 
 def get_env_int(name: str, default: int, min_value: int = 0) -> int:
@@ -589,6 +595,19 @@ def build_ai_input(item: Dict) -> str:
     return abstract
 
 
+def response_language_matches(response_fields: Dict, language: str) -> bool:
+    """A CJK-target language requires at least one CJK character somewhere in
+    the five fields. Terminology-heavy fields stay acceptable; only a fully
+    non-CJK answer counts as the wrong language, matching the observed
+    failure mode of occasionally all-English summaries."""
+    if str(language or "").strip().lower() not in CJK_REQUIRED_LANGUAGES:
+        return True
+    joined = " ".join(
+        str(response_fields.get(field, "")) for field in REQUIRED_AI_FIELDS
+    )
+    return bool(CJK_CHARACTER_PATTERN.search(joined))
+
+
 def invoke_with_retries(chain, payload: Dict, item_id: str) -> Structure:
     for attempt in range(1, AI_RETRY_ATTEMPTS + 1):
         try:
@@ -615,6 +634,11 @@ def invoke_with_retries(chain, payload: Dict, item_id: str) -> Structure:
                 raise IncompleteAIResponseError(
                     "AI returned an incomplete structured response; missing or empty fields: "
                     + ", ".join(missing_fields)
+                )
+            language = payload.get("language", "")
+            if not response_language_matches(response_fields, language):
+                raise WrongLanguageAIResponseError(
+                    f"AI returned complete fields in the wrong language (expected {language})"
                 )
             return response
         except Exception as exc:
@@ -844,6 +868,15 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         item.pop('AI_error', None)
         item.pop('AI_failure_reason', None)
         record_ai_success()
+    except WrongLanguageAIResponseError as e:
+        record_ai_failure(item.get("id", "unknown"), e)
+        print(f"Wrong-language AI response for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
+        apply_ai_fallback(
+            item,
+            "wrong_language",
+            "AI enhancement deferred because the response language did not match the requested language.",
+            exc=e,
+        )
     except IncompleteAIResponseError as e:
         record_ai_failure(item.get("id", "unknown"), e)
         print(f"Incomplete AI response for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
