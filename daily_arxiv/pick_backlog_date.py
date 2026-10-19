@@ -1,11 +1,11 @@
-"""Pick the recent date with the largest AI-enhancement gap for weekend sweeps.
+"""Pick the most recent date with incomplete AI results for backlog sweeps.
 
-Scans the data directory for dates inside the lookback window that have raw
-arXiv data (data/<date>.jsonl) but incomplete AI results, applying the same
-success rules as ai/checkpoint_status.py. Prints the date with the largest
-number of missing papers (oldest wins ties); prints nothing when every
-scanned date is complete. Only dates that already have raw data are
-considered, so a sweep can never fabricate historical dates.
+Scans the data directory from the newest date backwards inside the lookback
+window, applying the same success rules as ai/checkpoint_status.py, and
+returns the first date with missing papers. Recent content stays fresh while
+older gaps are digested with leftover quota windows. Only dates that already
+have raw data are considered, so a sweep can never fabricate historical
+dates.
 """
 
 import argparse
@@ -69,8 +69,8 @@ def pick(
         current = date.fromisoformat(current)
     lookback_days = max(lookback_days, 0)
 
-    candidates = []
-    for offset in range(lookback_days, -1, -1):
+    candidates_scanned = 0
+    for offset in range(0, lookback_days + 1):
         date_text = (current - timedelta(days=offset)).isoformat()
         raw_path = data_dir / f"{date_text}.jsonl"
         if not raw_path.is_file() or raw_path.stat().st_size == 0:
@@ -85,15 +85,17 @@ def pick(
             )
             continue
         print(f"sweep candidate {date_text}: missing={missing}", file=sys.stderr)
+        candidates_scanned += 1
         if missing > 0:
-            candidates.append((date_text, missing))
-
-    if not candidates:
-        return None
-    # Candidates are ordered oldest -> newest, so max() keeps the oldest date
-    # among ties.
-    best_date, _ = max(candidates, key=lambda entry: entry[1])
-    return best_date
+            # Newest incomplete date first: recent content stays complete while
+            # older gaps are digested with leftover quota windows.
+            return date_text
+    if candidates_scanned:
+        print(
+            f"sweep scanned {candidates_scanned} dates; all complete",
+            file=sys.stderr,
+        )
+    return None
 
 
 def parse_args():

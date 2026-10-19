@@ -91,7 +91,9 @@ class PickBacklogDateTest(unittest.TestCase):
             today=today,
         )
 
-    def test_picks_date_with_largest_gap(self):
+    def test_picks_most_recent_incomplete_date(self):
+        # Newest-first: 2026-09-30 has the smallest gap but is the most
+        # recent incomplete date, so it goes before 09-29's larger gap.
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             for date_text, missing in (("2026-09-28", 3), ("2026-09-29", 10), ("2026-09-30", 5)):
@@ -101,9 +103,9 @@ class PickBacklogDateTest(unittest.TestCase):
                 rows += [deferred_row(paper_id) for paper_id in ids[20 - missing:]]
                 write_jsonl(data_dir / f"{date_text}_AI_enhanced_Chinese.jsonl", rows)
             picked = self.pick(data_dir, today=date(2026, 10, 4))
-            self.assertEqual("2026-09-29", picked)
+            self.assertEqual("2026-09-30", picked)
 
-    def test_oldest_date_wins_ties(self):
+    def test_newest_date_wins_when_scan_order_decides(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             for date_text in ("2026-09-28", "2026-09-30"):
@@ -115,7 +117,7 @@ class PickBacklogDateTest(unittest.TestCase):
                      deferred_row(ids[2]), deferred_row(ids[3])],
                 )
             picked = self.pick(data_dir, today=date(2026, 10, 4))
-            self.assertEqual("2026-09-28", picked)
+            self.assertEqual("2026-09-30", picked)
 
     def test_complete_dates_yield_none(self):
         with TemporaryDirectory() as tmp:
