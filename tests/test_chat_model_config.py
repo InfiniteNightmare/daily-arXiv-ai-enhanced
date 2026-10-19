@@ -33,6 +33,20 @@ class TestChatModelKwargs(unittest.TestCase):
             kwargs = enhance.build_chat_openai_kwargs("gpt-4o-mini")
         self.assertNotIn("extra_body", kwargs)
 
+    def test_effort_sent_when_thinking_not_disabled(self):
+        with mock.patch.object(enhance, "AI_DISABLE_THINKING", False), mock.patch.object(
+            enhance, "AI_THINKING_EFFORT", "low"
+        ):
+            kwargs = enhance.build_chat_openai_kwargs("MiniMax-M3.1-Flash")
+        self.assertEqual(kwargs["extra_body"], {"output_config": {"effort": "low"}})
+
+    def test_disabled_thinking_takes_precedence_over_effort(self):
+        with mock.patch.object(enhance, "AI_DISABLE_THINKING", True), mock.patch.object(
+            enhance, "AI_THINKING_EFFORT", "low"
+        ):
+            kwargs = enhance.build_chat_openai_kwargs("MiniMax-M3.1-Flash")
+        self.assertEqual(kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+
 
 class TestCheckpointThrottle(unittest.TestCase):
     def test_zero_interval_flushes_every_call(self):

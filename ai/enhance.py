@@ -122,6 +122,13 @@ AI_FULL_TEXT_MIN_INTERVAL_SECONDS = get_env_float("AI_FULL_TEXT_MIN_INTERVAL_SEC
 AI_FULL_TEXT_MAX_CHARS = get_env_int("AI_FULL_TEXT_MAX_CHARS", 0, min_value=0)
 AI_FULL_TEXT_MIN_CHARS = get_env_int("AI_FULL_TEXT_MIN_CHARS", 2000, min_value=0)
 AI_DISABLE_THINKING = get_env_bool("AI_DISABLE_THINKING", True)
+AI_THINKING_EFFORT = (os.environ.get("AI_THINKING_EFFORT") or "").strip().lower() or None
+if AI_THINKING_EFFORT and AI_THINKING_EFFORT not in {"low", "medium", "high", "xhigh", "max"}:
+    print(
+        f"Invalid AI_THINKING_EFFORT={AI_THINKING_EFFORT}; ignoring",
+        file=sys.stderr,
+    )
+    AI_THINKING_EFFORT = None
 AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS = get_env_float(
     "AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS", 60.0, min_value=0.0
 )
@@ -751,11 +758,13 @@ def parse_args():
 
 
 def build_chat_openai_kwargs(model_name: str) -> Dict:
-    """ChatOpenAI settings; the thinking toggle keeps today's default behavior.
+    """ChatOpenAI settings; the thinking knobs keep today's default behavior.
 
-    The extra_body thinking switch is provider-specific, so it stays
-    configurable: AI_DISABLE_THINKING=false drops it for providers that
-    reject unknown parameters.
+    AI_DISABLE_THINKING=true sends the provider-specific thinking-disabled
+    switch (required by some providers, rejected by models that force
+    adaptive thinking such as MiniMax-M3.1-Flash). When thinking is not
+    disabled, AI_THINKING_EFFORT optionally requests a thinking depth via
+    output_config.effort.
     """
     kwargs = {
         "model": model_name,
@@ -764,6 +773,8 @@ def build_chat_openai_kwargs(model_name: str) -> Dict:
     }
     if AI_DISABLE_THINKING:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    elif AI_THINKING_EFFORT:
+        kwargs["extra_body"] = {"output_config": {"effort": AI_THINKING_EFFORT}}
     return kwargs
 
 

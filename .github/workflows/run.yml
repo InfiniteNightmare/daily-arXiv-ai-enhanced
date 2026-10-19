@@ -335,6 +335,7 @@ jobs:
         ai_checkpoint_enabled="${{ vars.AI_CHECKPOINT_ENABLED }}"
         ai_checkpoint_interval_seconds="${{ vars.AI_CHECKPOINT_INTERVAL_SECONDS }}"
         ai_disable_thinking="${{ vars.AI_DISABLE_THINKING }}"
+        ai_thinking_effort="${{ vars.AI_THINKING_EFFORT }}"
         ai_local_checkpoint_interval_seconds="${{ vars.AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS }}"
         if [ -z "$language" ]; then language="Chinese"; fi
         if [ -z "$model_name" ]; then model_name="deepseek-chat"; fi
@@ -391,6 +392,7 @@ jobs:
         export AI_CHECKPOINT_ENABLED="$ai_checkpoint_enabled"
         export AI_CHECKPOINT_INTERVAL_SECONDS="$ai_checkpoint_interval_seconds"
         export AI_DISABLE_THINKING="$ai_disable_thinking"
+        export AI_THINKING_EFFORT="$ai_thinking_effort"
         export AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS="$ai_local_checkpoint_interval_seconds"
         export SENSITIVE_CHECK_ENABLED="${{ vars.SENSITIVE_CHECK_ENABLED }}"
 
