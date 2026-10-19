@@ -165,7 +165,7 @@ def sample_item():
     }
 
 
-def complete_ai_fields(details="generated"):
+def complete_ai_fields(details="已生成的中文结果"):
     return {
         "tldr": details,
         "motivation": details,
@@ -341,7 +341,7 @@ class RetryPolicyTests(EnhanceStateTestCase):
         chain = SequencedChain(
             [
                 FakeStructuredResponse(incomplete_fields),
-                FakeStructuredResponse(complete_ai_fields("complete after retry")),
+                FakeStructuredResponse(complete_ai_fields("重试后完成")),
             ]
         )
 
@@ -355,7 +355,7 @@ class RetryPolicyTests(EnhanceStateTestCase):
                 "2608.incomplete",
             )
 
-        self.assertEqual(response.model_dump()["result"], "complete after retry")
+        self.assertEqual(response.model_dump()["result"], "重试后完成")
         self.assertEqual(len(chain.calls), 2)
         retry_sleep.assert_called_once()
 
