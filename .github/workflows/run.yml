@@ -69,10 +69,15 @@ jobs:
         git checkout origin/data -- data assets/file-list.txt 2>/dev/null || true
 
         weekday_backlog_fallback=false
+        backlog_continue=false
         if [ -n "$requested_date" ]; then
           today="$requested_date"
         elif [ "${{ github.event_name }}" = "schedule" ]; then
           scheduled_cron="${{ github.event.schedule }}"
+          # Scheduled runs may keep sweeping more backlog dates inside the
+          # same quota window once the primary date is done; manual runs
+          # never do (explicit-date semantics).
+          backlog_continue=true
           schedule_day_field=$(printf '%s' "$scheduled_cron" | awk '{print $NF}')
           if [ "$schedule_day_field" != "1-5" ]; then
             sweep_lookback_days="${{ vars.SWEEP_LOOKBACK_DAYS }}"
@@ -142,6 +147,7 @@ jobs:
         fi
 
         echo "crawl_date=$today" >> "$GITHUB_OUTPUT"
+        echo "backlog_continue=$backlog_continue" >> "$GITHUB_OUTPUT"
 
         if [[ ! "$today" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
           echo "Invalid process_date: $today. Expected YYYY-MM-DD."
@@ -314,6 +320,7 @@ jobs:
       run: |
         source .venv/bin/activate
         today=${{ steps.crawl_step.outputs.crawl_date }}
+        backlog_continue="${{ steps.crawl_step.outputs.backlog_continue }}"
         language="${{ vars.LANGUAGE }}"
         model_name="${{ vars.MODEL_NAME }}"
         ai_max_workers="${{ vars.AI_MAX_WORKERS }}"
@@ -337,6 +344,7 @@ jobs:
         ai_disable_thinking="${{ vars.AI_DISABLE_THINKING }}"
         ai_thinking_effort="${{ vars.AI_THINKING_EFFORT }}"
         ai_local_checkpoint_interval_seconds="${{ vars.AI_LOCAL_CHECKPOINT_INTERVAL_SECONDS }}"
+        ai_backlog_continue_seconds="${{ vars.AI_BACKLOG_CONTINUE_SECONDS }}"
         if [ -z "$language" ]; then language="Chinese"; fi
         if [ -z "$model_name" ]; then model_name="deepseek-chat"; fi
         if [ -z "$ai_max_workers" ]; then ai_max_workers="1"; fi
@@ -365,6 +373,12 @@ jobs:
         if ! [[ "$ai_local_checkpoint_interval_seconds" =~ ^[0-9]+$ ]]; then
           ai_local_checkpoint_interval_seconds="60"
         fi
+        if [ -z "$ai_backlog_continue_seconds" ]; then ai_backlog_continue_seconds="7200"; fi
+        if ! [[ "$ai_backlog_continue_seconds" =~ ^[0-9]+$ ]]; then
+          ai_backlog_continue_seconds="7200"
+        fi
+        sweep_lookback_days="${{ vars.SWEEP_LOOKBACK_DAYS }}"
+        if [ -z "$sweep_lookback_days" ]; then sweep_lookback_days="7"; fi
         echo "开始AI增强处理... / Starting AI enhancement processing..."
 
         cd ai
@@ -517,24 +531,91 @@ jobs:
         trap 'finalize_ai_checkpoint TERM' TERM
 
         set +e
-        python enhance.py --data "$RAW_FILE" --max_workers "$ai_max_workers" &
+        python enhance.py --data "$RAW_FILE" &
         enhance_pid=$!
         wait "$enhance_pid"
         enhance_exit_code=$?
         enhance_pid=""
         set -e
-        finalize_ai_checkpoint
 
         if [ "$enhance_exit_code" -ne 0 ]; then
           echo "AI增强处理失败，已尝试保存checkpoint / AI enhancement failed; checkpoint save was attempted"
+          finalize_ai_checkpoint
           exit "$enhance_exit_code"
         fi
 
-        if [ ! -s "$AI_FILE" ]; then
+        primary_ai_file="$AI_FILE"
+        if [ ! -s "$primary_ai_file" ]; then
           echo "AI处理失败：增强文件为空 / AI processing failed: enhanced file is empty"
-          echo "AI文件: $AI_FILE"
+          echo "AI文件: $primary_ai_file"
+          finalize_ai_checkpoint
           exit 1
         fi
+
+        # 额度窗口内续跑：首选日期完成后，继续按最新优先顺序回扫更多积压
+        # 日期，直到时间预算耗尽、积压清空、当轮零新增成功（疑似额度或
+        # 供应商异常）或达到单窗口日期上限；仍是一次只处理一个日期。
+        # Quota-window continuation: keep sweeping backlog dates inside this
+        # run while the budget lasts, so a window is never left idle.
+        if [ "$backlog_continue" = "true" ] && [ "$ai_backlog_continue_seconds" -gt 0 ]; then
+          continuation_started_at=$SECONDS
+          continuation_dates=0
+          while true; do
+            remaining=$(( ai_backlog_continue_seconds - (SECONDS - continuation_started_at) ))
+            if [ "$remaining" -lt 300 ]; then
+              echo "回扫续跑：剩余时间预算 ${remaining}s 不足，结束本窗口 / Backlog continuation: time budget exhausted"
+              break
+            fi
+            if [ "$continuation_dates" -ge 10 ]; then
+              echo "回扫续跑：达到单窗口 10 个日期上限 / Backlog continuation: per-window date cap reached"
+              break
+            fi
+            set +e
+            next_date=$(python ../daily_arxiv/pick_backlog_date.py "$GITHUB_WORKSPACE/data" \
+              --lookback-days "$sweep_lookback_days" \
+              --language "$LANGUAGE" \
+              --input-source "$AI_INPUT_SOURCE")
+            pick_status=$?
+            set -e
+            if [ "$pick_status" -ne 0 ]; then
+              echo "回扫续跑：选择日期失败，结束续跑 / Backlog continuation: date selection failed"
+              break
+            fi
+            if [ -z "$next_date" ]; then
+              echo "回扫续跑：近 $sweep_lookback_days 天没有未完成日期，本窗口额度已用满 / Backlog continuation: no incomplete dates left in the lookback window"
+              break
+            fi
+            next_raw="$GITHUB_WORKSPACE/data/${next_date}.jsonl"
+            next_ai="$GITHUB_WORKSPACE/data/${next_date}_AI_enhanced_${LANGUAGE}.jsonl"
+            if [ ! -s "$next_raw" ]; then
+              echo "回扫续跑：$next_date 缺少原始数据（异常），结束续跑 / Backlog continuation: $next_date has no raw data"
+              break
+            fi
+            ok_before=$(jq -s '[.[] | select(.AI_status == "ok")] | length' "$next_ai" 2>/dev/null || echo 0)
+            echo "回扫续跑：处理 $next_date（已成功 $ok_before 篇，剩余预算 ${remaining}s）/ Backlog continuation: processing $next_date"
+            today="$next_date"
+            RAW_FILE="$next_raw"
+            AI_FILE="$next_ai"
+            export AI_MAX_SECONDS="$remaining"
+            set +e
+            python enhance.py --data "$RAW_FILE" --max_workers "$ai_max_workers"
+            continuation_exit_code=$?
+            set -e
+            if [ "$continuation_exit_code" -ne 0 ]; then
+              echo "回扫续跑：$next_date 增强异常退出（$continuation_exit_code），结束续跑 / Backlog continuation: enhance exited $continuation_exit_code"
+              break
+            fi
+            continuation_dates=$((continuation_dates + 1))
+            ok_after=$(jq -s '[.[] | select(.AI_status == "ok")] | length' "$AI_FILE" 2>/dev/null || echo 0)
+            if [ "$ok_after" -le "$ok_before" ]; then
+              echo "回扫续跑：$next_date 本轮零新增成功（$ok_after 篇），疑似额度耗尽或供应商异常，结束续跑 / Backlog continuation: no new successes; stopping"
+              break
+            fi
+            (cd "$GITHUB_WORKSPACE/to_md" && python convert.py --data "../data/${next_date}_AI_enhanced_${LANGUAGE}.jsonl") || \
+              echo "回扫续跑：$next_date Markdown 转换失败，继续 / Backlog continuation: markdown conversion failed for $next_date; continuing"
+          done
+        fi
+        finalize_ai_checkpoint
         echo "AI增强处理完成 / AI enhancement processing completed"
 
     - name: Convert to Markdown

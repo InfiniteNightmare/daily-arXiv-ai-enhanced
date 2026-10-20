@@ -84,11 +84,11 @@ def pick(
                 file=sys.stderr,
             )
             continue
-        print(f"sweep candidate {date_text}: missing={missing}", file=sys.stderr)
         candidates_scanned += 1
         if missing > 0:
             # Newest incomplete date first: recent content stays complete while
             # older gaps are digested with leftover quota windows.
+            print(f"sweep picked {date_text}: missing={missing}", file=sys.stderr)
             return date_text
     if candidates_scanned:
         print(
