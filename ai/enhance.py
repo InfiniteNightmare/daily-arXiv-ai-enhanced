@@ -1012,13 +1012,13 @@ class CheckpointThrottle:
 
     def __init__(self, interval_seconds: float):
         self.interval_seconds = interval_seconds
-        self.last_saved_at = 0.0
+        self.last_saved_at = None
 
     def should_save(self) -> bool:
         if self.interval_seconds <= 0:
             return True
         now = time.monotonic()
-        if now - self.last_saved_at >= self.interval_seconds:
+        if self.last_saved_at is None or now - self.last_saved_at >= self.interval_seconds:
             self.last_saved_at = now
             return True
         return False

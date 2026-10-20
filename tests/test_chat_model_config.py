@@ -59,6 +59,14 @@ class TestCheckpointThrottle(unittest.TestCase):
         self.assertTrue(saver.should_save())
         self.assertFalse(saver.should_save())
 
+    def test_first_call_saves_even_on_a_fresh_clock(self):
+        # A brand-new runner can have time.monotonic() smaller than the
+        # interval; the first flush must still happen.
+        saver = enhance.CheckpointThrottle(3600.0)
+        with mock.patch.object(enhance.time, "monotonic", return_value=5.0):
+            self.assertTrue(saver.should_save())
+            self.assertFalse(saver.should_save())
+
     def test_flushes_again_after_interval_elapses(self):
         saver = enhance.CheckpointThrottle(1.0)
         self.assertTrue(saver.should_save())
