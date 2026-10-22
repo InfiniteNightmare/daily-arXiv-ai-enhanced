@@ -12,6 +12,7 @@ if str(AI_DIR) not in sys.path:
     sys.path.insert(0, str(AI_DIR))
 
 import enhance  # noqa: E402
+import checkpoint_status  # noqa: E402
 
 
 class DummyResponse:
@@ -107,10 +108,28 @@ def ordinary_422_error():
         "type": "error",
         "error": {
             "type": "unprocessable_entity_error",
-            "message": "input new_sensitive (1026)",
+            "message": "input request payload is malformed (1027)",
             "http_code": "422",
         },
         "request_id": "06d6f8df98a84f336161b1e2b34aa585",
+    }
+    return ProviderError(
+        f"Error code: 422 - {body}",
+        status_code=422,
+        response=DummyResponse(422),
+        body=body,
+    )
+
+
+def content_rejection_422_error():
+    body = {
+        "type": "error",
+        "error": {
+            "type": "unprocessable_entity_error",
+            "message": "input new_sensitive (1026)",
+            "http_code": "422",
+        },
+        "request_id": "07293b7695ba3300523a73b68df39231",
     }
     return ProviderError(
         f"Error code: 422 - {body}",
@@ -260,6 +279,7 @@ class StatusCodeExtractionTests(EnhanceStateTestCase):
                 self.assertTrue(enhance.is_run_terminal_ai_exception(error))
 
         self.assertFalse(enhance.is_run_terminal_ai_exception(ordinary_422_error()))
+        self.assertFalse(enhance.is_run_terminal_ai_exception(content_rejection_422_error()))
 
 
 class CircuitBreakerTests(EnhanceStateTestCase):
@@ -277,6 +297,15 @@ class CircuitBreakerTests(EnhanceStateTestCase):
         enhance.record_ai_failure("2608.12346", ordinary_422_error())
 
         self.assertFalse(enhance.is_ai_circuit_open())
+
+    def test_repeated_content_rejections_do_not_open_circuit(self):
+        enhance.AI_CIRCUIT_BREAKER_FAILURES = 2
+
+        enhance.record_ai_failure("2610.29342", content_rejection_422_error())
+        enhance.record_ai_failure("2610.29343", content_rejection_422_error())
+
+        self.assertFalse(enhance.is_ai_circuit_open())
+        self.assertEqual(enhance.AI_CONSECUTIVE_FAILURES, 0)
 
     def test_repeated_provider_outages_still_open_circuit(self):
         enhance.AI_CIRCUIT_BREAKER_FAILURES = 2
@@ -334,6 +363,20 @@ class RetryPolicyTests(EnhanceStateTestCase):
 
         self.assertEqual(len(chain.calls), enhance.AI_RETRY_ATTEMPTS)
         self.assertEqual(retry_sleep.call_count, enhance.AI_RETRY_ATTEMPTS - 1)
+
+    def test_content_rejection_422_is_not_retried(self):
+        chain = FakeChain(content_rejection_422_error())
+
+        with mock.patch.object(enhance.time, "sleep") as retry_sleep:
+            with self.assertRaises(ProviderError):
+                enhance.invoke_with_retries(
+                    chain,
+                    {"language": "Chinese", "content": "sensitive paper"},
+                    "2610.29342",
+                )
+
+        self.assertEqual(len(chain.calls), 1)
+        retry_sleep.assert_not_called()
 
     def test_incomplete_structured_response_is_retried_until_complete(self):
         incomplete_fields = complete_ai_fields()
@@ -439,6 +482,29 @@ class SingleItemFailureFlowTests(EnhanceStateTestCase):
         self.assert_metadata_preserved(original, processed)
         self.assertEqual(set(enhance.REQUIRED_AI_FIELDS) - set(processed["AI"]), set())
 
+    def test_content_rejection_marks_item_rejected_without_circuit(self):
+        original = sample_item()
+        item = copy.deepcopy(original)
+        chain = FakeChain(content_rejection_422_error())
+
+        with (
+            mock.patch.object(enhance, "build_ai_input", return_value=original["summary"]),
+            mock.patch.object(enhance, "is_sensitive", return_value=False),
+            mock.patch.object(enhance.time, "sleep") as sleep,
+        ):
+            processed = enhance.process_single_item(chain, item, "Chinese")
+
+        self.assertEqual(len(chain.calls), 1)
+        sleep.assert_not_called()
+        self.assertFalse(enhance.is_ai_circuit_open())
+        self.assertEqual(processed["AI_status"], "rejected")
+        self.assertEqual(processed["AI_failure_reason"], "content_rejected")
+        self.assertIn("422", processed["AI_error"])
+        self.assert_metadata_preserved(original, processed)
+        self.assertEqual(set(enhance.REQUIRED_AI_FIELDS) - set(processed["AI"]), set())
+        self.assertFalse(checkpoint_status.needs_ai_retry(processed))
+        self.assertTrue(enhance.is_resumable_result(processed))
+
     def test_partial_parser_output_is_deferred(self):
         item = sample_item()
         error = enhance.langchain_core.exceptions.OutputParserException(
@@ -457,7 +523,7 @@ class SingleItemFailureFlowTests(EnhanceStateTestCase):
         self.assertEqual(processed["AI_failure_reason"], "output_parser_error")
         self.assertEqual(processed["AI"]["tldr"], "partial summary")
 
-    def test_sensitive_input_and_output_are_deferred(self):
+    def test_sensitive_input_is_permanent_and_output_is_deferred(self):
         input_item = sample_item()
         input_chain = FakeChain()
         with (
@@ -467,8 +533,9 @@ class SingleItemFailureFlowTests(EnhanceStateTestCase):
             input_result = enhance.process_single_item(input_chain, input_item, "Chinese")
 
         self.assertEqual(input_chain.calls, [])
-        self.assertEqual(input_result["AI_status"], "deferred")
+        self.assertEqual(input_result["AI_status"], "rejected")
         self.assertEqual(input_result["AI_failure_reason"], "sensitive_input")
+        self.assertFalse(checkpoint_status.needs_ai_retry(input_result))
 
         output_item = sample_item()
         output_chain = SuccessfulChain()
@@ -572,6 +639,16 @@ class ResumableResultTests(EnhanceStateTestCase):
         self.assertFalse(enhance.is_resumable_result(partial))
         self.assertFalse(enhance.is_resumable_result(ordinary_fallback))
         self.assertFalse(enhance.is_resumable_result(unknown))
+
+    def test_rejected_content_result_is_resumable_and_never_retried(self):
+        rejected = self.result(
+            "rejected",
+            "Error code: 422 - {'error': {'type': 'unprocessable_entity_error', "
+            "'message': 'input new_sensitive (1026)'}}",
+        )
+
+        self.assertFalse(checkpoint_status.needs_ai_retry(rejected))
+        self.assertTrue(enhance.is_resumable_result(rejected))
 
     def test_legacy_success_without_status_remains_resumable(self):
         legacy_success = {

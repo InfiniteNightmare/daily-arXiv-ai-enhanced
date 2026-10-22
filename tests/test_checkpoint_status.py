@@ -108,6 +108,25 @@ class CheckDayTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertIn("complete:", output)
 
+    def test_check_day_treats_rejected_content_as_complete(self):
+        rejected = {
+            "id": "2608.12345",
+            "AI": ai_fields("AI enhancement permanently skipped (content_rejected)."),
+            "AI_status": "rejected",
+            "AI_failure_reason": "content_rejected",
+            "AI_error": (
+                "Error code: 422 - {'type': 'error', 'error': "
+                "{'type': 'unprocessable_entity_error', "
+                "'message': 'input new_sensitive (1026)', 'http_code': '422'}}"
+            ),
+        }
+
+        self.assertFalse(checkpoint_status.needs_ai_retry(rejected))
+        result, output = self.check_single_result(rejected)
+        self.assertTrue(result)
+        self.assertIn("complete:", output)
+        self.assertIn("ai=1", output)
+
     def test_check_day_matches_full_input_resume_rule(self):
         explicit_ok_without_source = {
             "id": "2608.12345",

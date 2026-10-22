@@ -73,6 +73,10 @@ def is_legacy_success(item: dict) -> bool:
 
 def needs_ai_retry(item: dict) -> bool:
     status = item.get("AI_status")
+    if status == "rejected":
+        # 内容审查拒绝是单篇终态：重试不会改变结果，也不构成当日缺口，
+        # 否则永远失败的条目会把回扫楔在有缺口的日期上。
+        return False
     if status is None:
         return not has_complete_legacy_ai_fields(item) or not is_legacy_success(item)
     return (
@@ -85,6 +89,9 @@ def needs_ai_retry(item: dict) -> bool:
 def is_resumable_ai_result(item: dict, input_source: str) -> bool:
     if not item.get("id") or needs_ai_retry(item):
         return False
+    if item.get("AI_status") == "rejected":
+        # 内容审查拒绝是终态：换输入源（abstract→full）重试也不会改变结果。
+        return True
     if item.get("AI_status") is None:
         return True
     return not (

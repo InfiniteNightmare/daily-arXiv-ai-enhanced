@@ -553,13 +553,17 @@ jobs:
         fi
 
         # 额度窗口内续跑：首选日期完成后，继续按最新优先顺序回扫更多积压
-        # 日期，直到时间预算耗尽、积压清空、当轮零新增成功（疑似额度或
-        # 供应商异常）或达到单窗口日期上限；仍是一次只处理一个日期。
-        # Quota-window continuation: keep sweeping backlog dates inside this
-        # run while the budget lasts, so a window is never left idle.
+        # 日期，直到时间预算耗尽、积压清空、连续多个日期零新增（疑似额度
+        # 或供应商异常）或达到单窗口日期上限；仍是一次只处理一个日期。
+        # 零新增的日期在本窗口内被排除（--exclude），单篇永久失败（如内容
+        # 审查 422 标记的 rejected）不会卡住整轮回扫。
+        # Quota-window continuation: keep sweeping backlog dates inside this run
+        # while the budget lasts, so a window is never left idle.
         if [ "$backlog_continue" = "true" ] && [ "$ai_backlog_continue_seconds" -gt 0 ]; then
           continuation_started_at=$SECONDS
           continuation_dates=0
+          zero_progress_dates=0
+          excluded_dates=""
           while true; do
             remaining=$(( ai_backlog_continue_seconds - (SECONDS - continuation_started_at) ))
             if [ "$remaining" -lt 300 ]; then
@@ -570,11 +574,15 @@ jobs:
               echo "回扫续跑：达到单窗口 10 个日期上限 / Backlog continuation: per-window date cap reached"
               break
             fi
+            pick_exclude_args=()
+            for excluded_date in $excluded_dates; do
+              pick_exclude_args+=(--exclude "$excluded_date")
+            done
             set +e
             next_date=$(python ../daily_arxiv/pick_backlog_date.py "$GITHUB_WORKSPACE/data" \
               --lookback-days "$sweep_lookback_days" \
               --language "$LANGUAGE" \
-              --input-source "$AI_INPUT_SOURCE")
+              --input-source "$AI_INPUT_SOURCE" "${pick_exclude_args[@]}")
             pick_status=$?
             set -e
             if [ "$pick_status" -ne 0 ]; then
@@ -592,6 +600,7 @@ jobs:
               break
             fi
             ok_before=$(jq -s '[.[] | select(.AI_status == "ok")] | length' "$next_ai" 2>/dev/null || echo 0)
+            resolved_before=$(jq -s '[.[] | select(.AI_status == "ok" or .AI_status == "rejected")] | length' "$next_ai" 2>/dev/null || echo 0)
             echo "回扫续跑：处理 $next_date（已成功 $ok_before 篇，剩余预算 ${remaining}s）/ Backlog continuation: processing $next_date"
             today="$next_date"
             RAW_FILE="$next_raw"
@@ -607,10 +616,18 @@ jobs:
             fi
             continuation_dates=$((continuation_dates + 1))
             ok_after=$(jq -s '[.[] | select(.AI_status == "ok")] | length' "$AI_FILE" 2>/dev/null || echo 0)
-            if [ "$ok_after" -le "$ok_before" ]; then
-              echo "回扫续跑：$next_date 本轮零新增成功（$ok_after 篇），疑似额度耗尽或供应商异常，结束续跑 / Backlog continuation: no new successes; stopping"
-              break
+            resolved_after=$(jq -s '[.[] | select(.AI_status == "ok" or .AI_status == "rejected")] | length' "$AI_FILE" 2>/dev/null || echo 0)
+            if [ "$resolved_after" -le "$resolved_before" ]; then
+              zero_progress_dates=$((zero_progress_dates + 1))
+              excluded_dates="$excluded_dates $next_date"
+              echo "回扫续跑：$next_date 本轮零新增（成功 $ok_after 篇），本窗口跳过该日期；连续第 $zero_progress_dates 个零进展日期 / Backlog continuation: no new successes ($ok_after ok); skipping $next_date for this window ($zero_progress_dates consecutive)"
+              if [ "$zero_progress_dates" -ge 3 ]; then
+                echo "回扫续跑：连续 3 个日期零新增，疑似额度耗尽或供应商异常，结束续跑 / Backlog continuation: stopping after 3 consecutive zero-progress dates"
+                break
+              fi
+              continue
             fi
+            zero_progress_dates=0
             (cd "$GITHUB_WORKSPACE/to_md" && python convert.py --data "../data/${next_date}_AI_enhanced_${LANGUAGE}.jsonl") || \
               echo "回扫续跑：$next_date Markdown 转换失败，继续 / Backlog continuation: markdown conversion failed for $next_date; continuing"
           done

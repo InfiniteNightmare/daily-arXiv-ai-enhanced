@@ -56,6 +56,16 @@ RUN_TERMINAL_ERROR_TEXT_MARKERS = (
     "token plan usage limit",
     "token plan 用量上限",
 )
+# 422 + 这些标记代表供应商内容审查拒绝（如 "input new_sensitive (1026)"）：
+# 对同一输入是确定性失败，重试无意义，也不是账户级错误。
+CONTENT_REJECTION_HTTP_STATUS = 422
+CONTENT_REJECTION_ERROR_MARKERS = (
+    "new_sensitive",
+    "content_policy",
+    "content_filter",
+    "content moderation",
+    "sensitive content",
+)
 STATUS_CODE_PATTERN = re.compile(
     r"(?:error\s+code|status(?:\s+code)?|status_code|http_code)[\"'\s:=]+(\d{3})",
     re.IGNORECASE,
@@ -312,7 +322,21 @@ def is_run_terminal_ai_exception(exc: Exception) -> bool:
     return any(marker in error_text for marker in RUN_TERMINAL_ERROR_TEXT_MARKERS)
 
 
+def is_content_rejection_exception(exc: Exception) -> bool:
+    """内容审查类 422：对相同输入是确定性拒绝。
+
+    既不能当账户级错误停止整轮，也不值得重试——只应把当前条目记为
+    单篇终态（AI_status=rejected），避免它把回扫永久楔在有缺口的日期上。
+    """
+    if get_status_code(exc) != CONTENT_REJECTION_HTTP_STATUS:
+        return False
+    error_text = normalized_error_text(exc)
+    return any(marker in error_text for marker in CONTENT_REJECTION_ERROR_MARKERS)
+
+
 def is_retryable_exception(exc: Exception) -> bool:
+    if is_content_rejection_exception(exc):
+        return False
     return not is_run_terminal_ai_exception(exc)
 
 
@@ -381,9 +405,10 @@ def apply_ai_fallback(
     reason: str,
     error: str = None,
     exc: Exception = None,
+    status: str = "deferred",
 ) -> Dict:
     item['AI'] = build_fallback_ai_fields(item, reason, exc)
-    item['AI_status'] = "deferred"
+    item['AI_status'] = status
     item['AI_failure_reason'] = reason
     if error is not None:
         item['AI_error'] = error
@@ -861,7 +886,8 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         return apply_ai_fallback(
             item,
             "sensitive_input",
-            "AI enhancement deferred because the input was rejected by the content check.",
+            "AI enhancement permanently skipped because the input was rejected by the content check.",
+            status="rejected",
         )
 
     # 检测代码可用性
@@ -922,14 +948,23 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
     except Exception as e:
         terminal_error = is_run_terminal_ai_exception(e)
+        content_rejected = is_content_rejection_exception(e)
         record_ai_failure(item.get("id", "unknown"), e)
         # Catch any other exceptions and keep the original arXiv metadata.
         print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-        apply_ai_fallback(
-            item,
-            "provider_account_error" if terminal_error else "llm_error",
-            exc=e,
-        )
+        if content_rejected:
+            apply_ai_fallback(
+                item,
+                "content_rejected",
+                exc=e,
+                status="rejected",
+            )
+        else:
+            apply_ai_fallback(
+                item,
+                "provider_account_error" if terminal_error else "llm_error",
+                exc=e,
+            )
     
     # Final validation to ensure all required fields exist
     for field in REQUIRED_AI_FIELDS:

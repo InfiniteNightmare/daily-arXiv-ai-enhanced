@@ -63,15 +63,19 @@ def pick(
     language: str,
     input_source: str,
     today: date | None = None,
+    exclude: list[str] | None = None,
 ) -> str | None:
     current = today or datetime.now(timezone.utc).date()
     if isinstance(current, str):
         current = date.fromisoformat(current)
     lookback_days = max(lookback_days, 0)
+    exclude_dates = set(exclude or [])
 
     candidates_scanned = 0
     for offset in range(0, lookback_days + 1):
         date_text = (current - timedelta(days=offset)).isoformat()
+        if date_text in exclude_dates:
+            continue
         raw_path = data_dir / f"{date_text}.jsonl"
         if not raw_path.is_file() or raw_path.stat().st_size == 0:
             continue
@@ -123,6 +127,13 @@ def parse_args():
         help="AI input source for the success rules (defaults to $AI_INPUT_SOURCE or 'abstract')",
     )
     parser.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        help="Date (YYYY-MM-DD) to skip even when incomplete; repeatable. "
+        "Used by the workflow to skip dates that made no progress in this window.",
+    )
+    parser.add_argument(
         "--today",
         default=None,
         help="Override the current UTC date (YYYY-MM-DD); for tests and diagnostics",
@@ -140,6 +151,7 @@ def main() -> int:
         language=language,
         input_source=input_source,
         today=args.today,
+        exclude=args.exclude,
     )
     if picked:
         print(picked)

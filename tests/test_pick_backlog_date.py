@@ -60,6 +60,26 @@ def deferred_row(paper_id):
     }
 
 
+def rejected_row(paper_id):
+    return {
+        "id": paper_id,
+        "AI_status": "rejected",
+        "AI_failure_reason": "content_rejected",
+        "AI_error": (
+            "Error code: 422 - {'type': 'error', 'error': "
+            "{'type': 'unprocessable_entity_error', "
+            "'message': 'input new_sensitive (1026)', 'http_code': '422'}}"
+        ),
+        "AI": {
+            "tldr": "abstract",
+            "motivation": "AI enhancement permanently skipped (content_rejected).",
+            "method": "AI enhancement unavailable; see the original abstract.",
+            "result": "AI enhancement unavailable; see the original abstract.",
+            "conclusion": "AI enhancement permanently skipped (content_rejected).",
+        },
+    }
+
+
 def legacy_ok_row(paper_id):
     return {
         "id": paper_id,
@@ -82,13 +102,14 @@ def make_raw(data_dir, date_text, count):
 
 class PickBacklogDateTest(unittest.TestCase):
     def pick(self, data_dir, *, lookback_days=7, language="Chinese",
-             input_source="full", today=None):
+             input_source="full", today=None, exclude=None):
         return pick_backlog_date.pick(
             data_dir,
             lookback_days=lookback_days,
             language=language,
             input_source=input_source,
             today=today,
+            exclude=exclude,
         )
 
     def test_picks_most_recent_incomplete_date(self):
@@ -118,6 +139,42 @@ class PickBacklogDateTest(unittest.TestCase):
                 )
             picked = self.pick(data_dir, today=date(2026, 10, 4))
             self.assertEqual("2026-09-30", picked)
+
+    def test_rejected_only_gap_does_not_block_the_sweep(self):
+        # A date whose only non-ok rows are content rejections is complete:
+        # the sweep must move on instead of re-picking it forever.
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            ids = paper_ids("2026-09-30", 2)
+            make_raw(data_dir, "2026-09-30", 2)
+            write_jsonl(
+                data_dir / "2026-09-30_AI_enhanced_Chinese.jsonl",
+                [ok_row(ids[0], input_source="full"), rejected_row(ids[1])],
+            )
+            make_raw(data_dir, "2026-09-29", 1)
+            write_jsonl(
+                data_dir / "2026-09-29_AI_enhanced_Chinese.jsonl",
+                [deferred_row(paper_ids("2026-09-29", 1)[0])],
+            )
+            picked = self.pick(data_dir, today=date(2026, 10, 4))
+            self.assertEqual("2026-09-29", picked)
+
+    def test_excluded_dates_are_skipped_for_the_current_window(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            for date_text in ("2026-09-28", "2026-09-29", "2026-09-30"):
+                ids = paper_ids(date_text, 2)
+                make_raw(data_dir, date_text, 2)
+                write_jsonl(
+                    data_dir / f"{date_text}_AI_enhanced_Chinese.jsonl",
+                    [ok_row(ids[0], input_source="full"), deferred_row(ids[1])],
+                )
+            picked = self.pick(
+                data_dir,
+                today=date(2026, 10, 4),
+                exclude=["2026-09-30", "2026-09-29"],
+            )
+            self.assertEqual("2026-09-28", picked)
 
     def test_complete_dates_yield_none(self):
         with TemporaryDirectory() as tmp:
