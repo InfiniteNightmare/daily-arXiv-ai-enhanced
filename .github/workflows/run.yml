@@ -22,6 +22,11 @@ on:
         description: "Date to process in YYYY-MM-DD; leave empty to use today's UTC date"
         required: false
         type: string
+      continue_backlog:
+        description: "After the primary date completes, keep sweeping backlog dates until the window budget is spent (scheduled-run semantics); default false keeps explicit-date semantics"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: arxiv-daily-ai-enhanced-${{ github.ref }}
@@ -101,6 +106,17 @@ jobs:
           fi
         else
           today="$current_utc_date"
+        fi
+
+        # 手动运行可选启用定时运行语义：处理完首选日期后续跑回扫、当天
+        # 已完整时回退到未完成日期。默认保持精确日期语义（只处理指定
+        # 日期、不消耗额外额度）。
+        # Manual runs may opt into scheduled-run semantics: continue the
+        # backlog sweep after the primary date and fall back to an incomplete
+        # date when today is complete. Default keeps explicit-date semantics.
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.continue_backlog }}" = "true" ]; then
+          backlog_continue=true
+          weekday_backlog_fallback=true
         fi
 
         raw_file="data/${today}.jsonl"
