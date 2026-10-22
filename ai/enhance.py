@@ -71,6 +71,8 @@ STATUS_CODE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 REQUIRED_AI_FIELDS = ["tldr", "motivation", "method", "result", "conclusion"]
+# U+FFFD：解码损坏的标志。输入侧剥离，输出侧视为损坏重试。
+REPLACEMENT_CHARACTER = "\ufffd"
 CJK_CHARACTER_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 CJK_REQUIRED_LANGUAGES = {"chinese", "zh", "zh-cn", "zh-hans", "中文", "简体中文", "汉语"}
 SENSITIVE_CHECK_URL = os.environ.get("SENSITIVE_CHECK_URL", "https://spam.dw-dengwei.workers.dev")
@@ -615,16 +617,20 @@ def build_ai_input(item: Dict) -> str:
     full_text = fetch_full_text(item)
     if full_text:
         item["AI_input_source"] = "full"
-        item["AI_input_chars"] = len(full_text)
-        return (
+        ai_input = (
             f"Title: {item.get('title', '')}\n\n"
             f"Abstract:\n{abstract}\n\n"
             f"Paper full text from arXiv:\n{full_text}"
         )
+    else:
+        item["AI_input_source"] = "abstract"
+        ai_input = abstract
 
-    item["AI_input_source"] = "abstract"
-    item["AI_input_chars"] = len(abstract)
-    return abstract
+    # 剥离替换字符：输入中的 U+FFFD 会被模型原样转述进摘要
+    # （2026-10-20 起观测到，集中在 full 输入路径）。
+    ai_input = ai_input.replace(REPLACEMENT_CHARACTER, "")
+    item["AI_input_chars"] = len(ai_input)
+    return ai_input
 
 
 def response_language_matches(response_fields: Dict, language: str) -> bool:
@@ -666,6 +672,18 @@ def invoke_with_retries(chain, payload: Dict, item_id: str) -> Structure:
                 raise IncompleteAIResponseError(
                     "AI returned an incomplete structured response; missing or empty fields: "
                     + ", ".join(missing_fields)
+                )
+            corrupted_fields = [
+                field
+                for field in REQUIRED_AI_FIELDS
+                if REPLACEMENT_CHARACTER in response_fields[field]
+            ]
+            if corrupted_fields:
+                # U+FFFD 说明响应在传输/解码环节被损坏（长输出偶发）；
+                # 重试通常得到干净结果，与不完整输出同一处理路径。
+                raise IncompleteAIResponseError(
+                    "AI returned fields containing replacement characters "
+                    "(decoding corruption): " + ", ".join(corrupted_fields)
                 )
             language = payload.get("language", "")
             if not response_language_matches(response_fields, language):

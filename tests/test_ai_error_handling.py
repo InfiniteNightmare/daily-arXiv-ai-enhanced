@@ -402,6 +402,29 @@ class RetryPolicyTests(EnhanceStateTestCase):
         self.assertEqual(len(chain.calls), 2)
         retry_sleep.assert_called_once()
 
+    def test_replacement_characters_are_retried_until_clean(self):
+        corrupted_fields = complete_ai_fields("社会与技术\uFFFD投入")
+        chain = SequencedChain(
+            [
+                FakeStructuredResponse(corrupted_fields),
+                FakeStructuredResponse(complete_ai_fields("重试后干净")),
+            ]
+        )
+
+        with (
+            mock.patch.object(enhance.time, "sleep") as retry_sleep,
+            mock.patch.object(enhance.random, "uniform", return_value=0.0),
+        ):
+            response = enhance.invoke_with_retries(
+                chain,
+                {"language": "Chinese", "content": "paper"},
+                "2610.corrupted",
+            )
+
+        self.assertEqual(response.model_dump()["tldr"], "重试后干净")
+        self.assertEqual(len(chain.calls), 2)
+        retry_sleep.assert_called_once()
+
 
 class SingleItemFailureFlowTests(EnhanceStateTestCase):
     def test_metadata_fallback_is_deferred_without_calling_llm(self):
@@ -567,6 +590,45 @@ class SingleItemFailureFlowTests(EnhanceStateTestCase):
         self.assertEqual(retry_sleep.call_count, enhance.AI_RETRY_ATTEMPTS - 1)
         self.assertEqual(processed["AI_status"], "deferred")
         self.assertEqual(processed["AI_failure_reason"], "incomplete_output")
+
+    def test_persistently_corrupted_output_is_deferred(self):
+        item = sample_item()
+        chain = SuccessfulChain(complete_ai_fields("社会与技术\uFFFD投入"))
+
+        with (
+            mock.patch.object(enhance, "build_ai_input", return_value=item["summary"]),
+            mock.patch.object(enhance, "is_sensitive", return_value=False),
+            mock.patch.object(enhance.time, "sleep") as retry_sleep,
+            mock.patch.object(enhance.random, "uniform", return_value=0.0),
+        ):
+            processed = enhance.process_single_item(chain, item, "Chinese")
+
+        self.assertEqual(len(chain.calls), enhance.AI_RETRY_ATTEMPTS)
+        self.assertEqual(processed["AI_status"], "deferred")
+        self.assertEqual(processed["AI_failure_reason"], "incomplete_output")
+
+    def test_build_ai_input_strips_replacement_characters(self):
+        enhance.AI_INPUT_SOURCE = "full"
+        full_item = sample_item()
+        with mock.patch.object(
+            enhance,
+            "fetch_full_text",
+            return_value="Paper full text with \uFFFD corrupted \uFFFD bytes.",
+        ):
+            full_input = enhance.build_ai_input(full_item)
+
+        self.assertEqual(full_item["AI_input_source"], "full")
+        self.assertNotIn("\uFFFD", full_input)
+        self.assertIn("corrupted  bytes", full_input)
+        self.assertEqual(full_item["AI_input_chars"], len(full_input))
+
+        abstract_item = sample_item()
+        abstract_item["summary"] = "Abstract with \uFFFD inside."
+        with mock.patch.object(enhance, "fetch_full_text", return_value=None):
+            abstract_input = enhance.build_ai_input(abstract_item)
+
+        self.assertEqual(abstract_item["AI_input_source"], "abstract")
+        self.assertNotIn("\uFFFD", abstract_input)
 
     def test_first_402_defers_three_sequential_items_with_only_one_llm_call(self):
         items = []
