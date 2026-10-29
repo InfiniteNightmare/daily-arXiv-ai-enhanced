@@ -287,7 +287,15 @@ jobs:
         cp "/tmp/crawl_state/data/_pending/${today}.jsonl" "$pending_file" 2>/dev/null || true
         cp "/tmp/crawl_state/data/_pending/${today}.metadata.jsonl" "$pending_metadata_file" 2>/dev/null || true
         cp "/tmp/crawl_state/data/_pending/${today}.low-capture.json" "$low_capture_marker" 2>/dev/null || true
-        git add "$pending_file" "$pending_metadata_file" "$low_capture_marker" 2>/dev/null || true
+        # git add aborts without staging anything when any pathspec is missing;
+        # on the low-capture defer path the pending files do not exist, and the
+        # old single git add silently dropped the marker, so the attempt
+        # counter never survived across scheduled runs. Add each existing file.
+        for pending_state_file in "$pending_file" "$pending_metadata_file" "$low_capture_marker"; do
+          if [ -s "$pending_state_file" ]; then
+            git add "$pending_state_file"
+          fi
+        done
 
         if git diff --staged --quiet; then
           echo "pending 状态没有变化 / Pending state unchanged"
