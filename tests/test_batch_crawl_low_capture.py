@@ -64,7 +64,11 @@ RECENT_HTML = """
 <li><a href="/list/cs.AI/recent?skip=22&amp;show=50">Thu, 15 Oct 2026</a></li></ul>
 <dl id='articles'>
 <h3>Fri, 16 Oct 2026 (showing 22 of 22 entries )</h3><dt>item 1</dt>
-<h3>Thu, 15 Oct 2026 (showing 5 of 5 entries )</h3><dt>item 2</dt>
+<h3>Thu, 15 Oct 2026 (showing 2 of 2 entries )</h3>
+<dt><a href="/abs/2610.33753" title="Abstract">arXiv:2610.33753</a>
+  (cross-list from cs.CR)</dt>
+<dt><a href="/abs/2610.33380" title="Abstract">arXiv:2610.33380</a>
+  (cross-list from cs.AR)</dt>
 </dl></div>
 """
 
@@ -76,17 +80,46 @@ class TestRecentSectionParsing(unittest.TestCase):
         self.assertEqual(batch_crawl.recent_section_label("2026-11-02"), "Mon, 2 Nov 2026")
 
     def test_parse_recent_page_top_and_lower_section(self):
-        total, top = batch_crawl.parse_recent_page(RECENT_HTML, "Fri, 16 Oct 2026")
+        total, top, excluded = batch_crawl.parse_recent_page(
+            RECENT_HTML, "Fri, 16 Oct 2026"
+        )
         self.assertEqual(total, 22)
         self.assertEqual(top, "2026-10-16")
-        total, top = batch_crawl.parse_recent_page(RECENT_HTML, "Thu, 15 Oct 2026")
-        self.assertEqual(total, 5)
+        self.assertEqual(excluded, 0)
+        total, top, excluded = batch_crawl.parse_recent_page(
+            RECENT_HTML, "Thu, 15 Oct 2026"
+        )
+        self.assertEqual(total, 2)
         self.assertEqual(top, "2026-10-16")
+        self.assertEqual(excluded, 0)
+
+    def test_parse_recent_page_excludes_non_target_crosslists(self):
+        # 2026-10-27 cs.OS: both section entries were cross-lists from
+        # categories outside the target set; /new parsing correctly yields 0
+        # candidates for such a section.
+        targets = {"cs.OS", "cs.AI"}
+        total, top, excluded = batch_crawl.parse_recent_page(
+            RECENT_HTML, "Thu, 15 Oct 2026", targets
+        )
+        self.assertEqual(total, 2)
+        self.assertEqual(excluded, 2)
+
+    def test_parse_recent_page_keeps_target_crosslists(self):
+        # A cross-list sourced from a target category IS a /new candidate.
+        targets = {"cs.OS", "cs.CR"}
+        total, top, excluded = batch_crawl.parse_recent_page(
+            RECENT_HTML, "Thu, 15 Oct 2026", targets
+        )
+        self.assertEqual(total, 2)
+        self.assertEqual(excluded, 1)
 
     def test_parse_recent_page_absent_target(self):
-        total, top = batch_crawl.parse_recent_page(RECENT_HTML, "Wed, 14 Oct 2026")
+        total, top, excluded = batch_crawl.parse_recent_page(
+            RECENT_HTML, "Wed, 14 Oct 2026"
+        )
         self.assertIsNone(total)
         self.assertEqual(top, "2026-10-16")
+        self.assertEqual(excluded, 0)
 
     def test_parse_recent_section_date(self):
         self.assertEqual(
@@ -151,6 +184,33 @@ class TestCaptureInconsistencies(unittest.TestCase):
             ["cs.AI", "cs.CL"], [0, 17], {"cs.CL": 177}, {"cs.CL": self.TARGET}, self.TARGET
         )
         self.assertEqual(issues, [])
+
+    def test_section_of_only_non_target_crosslists_is_not_an_issue(self):
+        # 2026-10-27: cs.OS's entire day section was two cross-lists from
+        # cs.CR/cs.AR (non-target sources); /new's zero parse was correct.
+        issues = batch_crawl.capture_inconsistencies(
+            ["cs.OS"],
+            [0],
+            {"cs.OS": 2},
+            {"cs.OS": self.TARGET},
+            self.TARGET,
+            {"cs.OS": 2},
+        )
+        self.assertEqual(issues, [])
+
+    def test_partially_excluded_crosslists_still_flag_zero_parse(self):
+        # One cross-list from a target source remains as candidate evidence.
+        issues = batch_crawl.capture_inconsistencies(
+            ["cs.OS"],
+            [0],
+            {"cs.OS": 2},
+            {"cs.OS": self.TARGET},
+            self.TARGET,
+            {"cs.OS": 1},
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertIn("cs.OS", issues[0])
+        self.assertIn("1 non-target cross-lists excluded", issues[0])
 
 
 class TestIsLowCapture(unittest.TestCase):
@@ -255,6 +315,7 @@ class TestCrawlRawLowCaptureFlow(unittest.TestCase):
             recent_report = (
                 {"cs.AI": 286, "cs.CL": 177},
                 {"cs.AI": "2026-10-15", "cs.CL": "2026-10-15"},
+                {"cs.AI": 0, "cs.CL": 0},
             )
         with mock.patch.object(
             batch_crawl,
@@ -329,6 +390,7 @@ class TestCrawlRawLowCaptureFlow(unittest.TestCase):
                     recent_report=(
                         {"cs.AI": None, "cs.CL": 40},
                         {"cs.AI": "2026-10-15", "cs.CL": "2026-10-15"},
+                        {"cs.AI": 0, "cs.CL": 0},
                     ),
                 )
             marker = output_dir / "_pending" / "2026-10-15.low-capture.json"
@@ -344,7 +406,7 @@ class TestCrawlRawLowCaptureFlow(unittest.TestCase):
             # /recent entirely unreachable: counts [0, 17] still defer via the
             # heuristic backstop.
             with self.assertRaises(batch_crawl.LowCaptureDeferred):
-                self.run_crawl(output_dir, recent_report=({}, {}))
+                self.run_crawl(output_dir, recent_report=({}, {}, {}))
             self.assertFalse((output_dir / "2026-10-15.jsonl").exists())
 
     def test_healthy_capture_clears_stale_marker(self):
@@ -362,10 +424,51 @@ class TestCrawlRawLowCaptureFlow(unittest.TestCase):
                 recent_report=(
                     {"cs.AI": 100, "cs.CL": 50},
                     {"cs.AI": "2026-10-15", "cs.CL": "2026-10-15"},
+                    {"cs.AI": 0, "cs.CL": 0},
                 ),
             )
             self.assertFalse(marker.exists())
             self.assertTrue((output_dir / "2026-10-15.jsonl").exists())
+
+    def test_crosslist_only_recent_section_accepts_zero_parse(self):
+        # 2026-10-27 end to end: cs.AI's section holds two cross-lists from
+        # non-target sources and /new parsed 0 for it, while the other two
+        # categories parsed normally and their sections agree. Rule A must not
+        # fire for cs.AI, so the crawl is accepted and raw is written on the
+        # first attempt. History of 30 keeps both heuristic thresholds quiet
+        # (zero fraction 1/3 < 0.5, total 20 >= 0.4*30).
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "2026-10-14.jsonl").write_text(
+                '{"id": "x"}\n' * 30, encoding="utf-8"
+            )
+            args = make_args(output_dir)
+            args.categories = "cs.AI,cs.CL,cs.OS"
+            recent_report = (
+                {"cs.AI": 2, "cs.CL": 40, "cs.OS": 2},
+                {
+                    "cs.AI": "2026-10-15",
+                    "cs.CL": "2026-10-15",
+                    "cs.OS": "2026-10-15",
+                },
+                {"cs.AI": 2, "cs.CL": 0, "cs.OS": 0},
+            )
+            with mock.patch.object(
+                batch_crawl,
+                "crawl_seed_papers_with_budget",
+                return_value=(fake_seeds(17), [0, 17, 3]),
+            ), mock.patch.object(
+                batch_crawl, "load_history_ids", return_value=set()
+            ), mock.patch.object(
+                batch_crawl, "resilient_metadata_batch", side_effect=fake_metadata
+            ), mock.patch.object(
+                batch_crawl, "fetch_recent_report", return_value=recent_report
+            ):
+                batch_crawl.crawl_raw(args)
+            self.assertTrue((output_dir / "2026-10-15.jsonl").exists())
+            self.assertFalse(
+                (output_dir / "_pending" / "2026-10-15.low-capture.json").exists()
+            )
 
 
 if __name__ == "__main__":

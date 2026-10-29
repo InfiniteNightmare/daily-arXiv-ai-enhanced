@@ -206,22 +206,48 @@ def parse_recent_section_date(label: str) -> str | None:
         return None
 
 
-def parse_recent_page(html: str, target_label: str) -> tuple[int | None, str | None]:
-    """Extract (target-date section total, top section date) from a /recent page.
+CROSS_LIST_SOURCE_PATTERN = re.compile(r"cross-list\s+from\s+([A-Za-z][\w.\-]*)")
+
+
+def parse_recent_page(
+    html: str,
+    target_label: str,
+    target_categories: set | None = None,
+) -> tuple[int | None, str | None, int]:
+    """Extract (target-date section total, top section date, non-target cross-lists).
 
     Section headers look like '<h3>Fri, 16 Oct 2026 (showing 22 of 22 entries )'
     and are ordered newest first; the target total is None when the target date
-    has no section on the page.
+    has no section on the page. The third value counts entries in the target
+    section annotated '(cross-list from X)' where X is not one of
+    ``target_categories``: /new parsing never yields such entries as candidates
+    (their primary category is foreign and the parser keeps only primary
+    categories from the target set), so a section consisting solely of them is
+    consistent with a zero /new parse and must not trigger rule A.
     """
     top_date = None
     target_total = None
-    for match in RECENT_SECTION_PATTERN.finditer(html):
+    excluded = 0
+    matches = list(RECENT_SECTION_PATTERN.finditer(html))
+    for index, match in enumerate(matches):
         label = match.group("label")
         if top_date is None:
             top_date = parse_recent_section_date(label)
-        if label == target_label:
-            target_total = int(match.group("total"))
-    return target_total, top_date
+        if label != target_label:
+            continue
+        target_total = int(match.group("total"))
+        if target_categories is not None:
+            section_end = (
+                matches[index + 1].start() if index + 1 < len(matches) else len(html)
+            )
+            section = html[match.end():section_end]
+            excluded = sum(
+                1
+                for source in CROSS_LIST_SOURCE_PATTERN.findall(section)
+                if source not in target_categories
+            )
+        break
+    return target_total, top_date, excluded
 
 
 def fetch_recent_report(
@@ -230,18 +256,21 @@ def fetch_recent_report(
     list_timeout: float,
     started_at: float,
     max_seconds: float,
-) -> tuple[Dict[str, int | None], Dict[str, str | None]]:
+) -> tuple[Dict[str, int | None], Dict[str, str | None], Dict[str, int]]:
     """Fetch each category's /recent page and locate the target-date section.
 
     Returns per-category maps of (section total or None when absent, top
-    section date). A category whose /recent page cannot be fetched is omitted
-    from both maps so the caller treats it as unverifiable rather than
-    inconsistent. Bounded retries: this verification must never hang a crawl.
+    section date, non-target cross-list count in the target section). A
+    category whose /recent page cannot be fetched is omitted from the maps so
+    the caller treats it as unverifiable rather than inconsistent. Bounded
+    retries: this verification must never hang a crawl.
     """
     target_label = recent_section_label(target_date)
+    targets = set(categories)
     session = requests.Session()
     totals: Dict[str, int | None] = {}
     top_dates: Dict[str, str | None] = {}
+    excluded_crosslists: Dict[str, int] = {}
     for category in categories:
         url = ARXIV_RECENT_URL_TEMPLATE.format(category=category)
         print(f"Fetching arXiv recent list: {url}", file=sys.stderr)
@@ -254,9 +283,12 @@ def fetch_recent_report(
                     url,
                     timeout_with_budget(list_timeout, started_at, max_seconds),
                 )
-                total, top_date = parse_recent_page(response.text, target_label)
+                total, top_date, excluded = parse_recent_page(
+                    response.text, target_label, targets
+                )
                 totals[category] = total
                 top_dates[category] = top_date
+                excluded_crosslists[category] = excluded
                 break
             except Exception as exc:  # noqa: BLE001
                 if not enhance.is_retryable_exception(exc) or attempt >= 3:
@@ -269,7 +301,7 @@ def fetch_recent_report(
                 delay = retry_delay_for_exception(attempt, 1.0, exc)
                 sleep_with_budget(delay, started_at, max_seconds)
                 attempt += 1
-    return totals, top_dates
+    return totals, top_dates, excluded_crosslists
 
 
 def capture_inconsistencies(
@@ -278,6 +310,7 @@ def capture_inconsistencies(
     recent_totals: Dict[str, int | None],
     recent_top_dates: Dict[str, str | None],
     target_date: str,
+    excluded_crosslists: Dict[str, int] | None = None,
 ) -> List[str]:
     """Cross-check /new parse results against the dated sections on /recent.
 
@@ -285,6 +318,13 @@ def capture_inconsistencies(
     also yields candidates from /new, and /recent's top section matches the
     target date. The three failure signatures below mean /new is serving
     stale, partial, or newer-than-target content and must not be locked in.
+
+    ``excluded_crosslists`` carries the per-category count of target-section
+    entries that are cross-lists from categories outside the target set; /new
+    parsing never yields those as candidates, so they are subtracted before
+    the parsed-zero comparison (2026-10-27: cs.OS announced only two
+    cross-lists from cs.CR/cs.AR and /new's correct zero was flagged as a
+    stale capture, blocking the whole day).
     """
     issues = []
     for category, parsed in zip(categories, category_counts):
@@ -292,10 +332,16 @@ def capture_inconsistencies(
             continue
         total = recent_totals[category]
         top_date = recent_top_dates.get(category)
-        if total is not None and total > 0 and parsed <= 0:
+        excluded = (excluded_crosslists or {}).get(category, 0)
+        effective_total = total - excluded if total is not None else None
+        if effective_total is not None and effective_total > 0 and parsed <= 0:
+            excluded_note = (
+                f" ({excluded} non-target cross-lists excluded)" if excluded else ""
+            )
             issues.append(
                 f"{category}: /recent shows {total} entries for {target_date} "
                 "but /new parsed 0 candidates"
+                f"{excluded_note}"
             )
         elif parsed > 0 and total is None:
             issues.append(
@@ -677,7 +723,7 @@ def crawl_raw(args) -> int:
 
         marker_path = low_capture_marker_path(output_dir, args.date)
         if unique_seeds:
-            recent_totals, recent_top_dates = fetch_recent_report(
+            recent_totals, recent_top_dates, recent_excluded = fetch_recent_report(
                 categories,
                 args.date,
                 args.list_timeout,
@@ -690,6 +736,7 @@ def crawl_raw(args) -> int:
                 recent_totals,
                 recent_top_dates,
                 args.date,
+                recent_excluded,
             )
             if issues:
                 print(
