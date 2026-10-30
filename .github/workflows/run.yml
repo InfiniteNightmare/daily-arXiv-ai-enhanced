@@ -206,6 +206,30 @@ jobs:
               echo "has_new_content=true" >> "$GITHUB_OUTPUT"
               ;;
             1)
+              # 全部候选都是已收录内容（/new 仍在服务旧 listing 或当天无
+              # 通告）时 raw 不存在，"当天已完整"式回退不会触发；让额度
+              # 窗口回扫未完成日期而不是空转。回扫日期由 picker 保证已有
+              # 完整 raw，无需重新爬取。与完整回退共用同一开关。
+              if [ "$backlog_continue" = "true" ]; then
+                sweep_lookback_days="${{ vars.SWEEP_LOOKBACK_DAYS }}"
+                if [ -z "$sweep_lookback_days" ]; then sweep_lookback_days="7"; fi
+                backlog_date=$(python daily_arxiv/pick_backlog_date.py data \
+                  --lookback-days "$sweep_lookback_days" \
+                  --language "$language" \
+                  --input-source "$ai_input_source") || exit 1
+                if [ -n "$backlog_date" ] && [ -s "data/${backlog_date}.jsonl" ]; then
+                  echo "当天没有新通告（/new 服务旧 listing 或无更新），本槽位回扫处理未完成日期 $backlog_date / No new announcements for the slot date (stale or absent listing); this slot sweeps the incomplete date $backlog_date"
+                  today="$backlog_date"
+                  raw_file="data/${today}.jsonl"
+                  ai_file="data/${today}_AI_enhanced_${language}.jsonl"
+                  md_file="data/${today}.md"
+                  echo "crawl_date=$today" >> "$GITHUB_OUTPUT"
+                  echo "has_new_content=true" >> "$GITHUB_OUTPUT"
+                  echo "skip_reason=no_new_content_swept_backlog" >> "$GITHUB_OUTPUT"
+                  echo "爬取完成 / Crawling completed"
+                  exit 0
+                fi
+              fi
               echo "has_new_content=false" >> "$GITHUB_OUTPUT"
               echo "skip_reason=no_new_content" >> "$GITHUB_OUTPUT"
               echo "没有新论文需要处理 / No new papers to process"
