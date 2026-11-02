@@ -131,7 +131,11 @@ AI_FULL_TEXT_RETRY_ATTEMPTS = get_env_int("AI_FULL_TEXT_RETRY_ATTEMPTS", 2, min_
 AI_FULL_TEXT_RETRY_BASE_SECONDS = get_env_float("AI_FULL_TEXT_RETRY_BASE_SECONDS", 2.0)
 AI_FULL_TEXT_RETRY_MAX_SECONDS = get_env_float("AI_FULL_TEXT_RETRY_MAX_SECONDS", 30.0)
 AI_FULL_TEXT_MIN_INTERVAL_SECONDS = get_env_float("AI_FULL_TEXT_MIN_INTERVAL_SECONDS", 0.5)
-AI_FULL_TEXT_MAX_CHARS = get_env_int("AI_FULL_TEXT_MAX_CHARS", 0, min_value=0)
+# Untruncated full text overflows the model context window on book-size
+# papers (arXiv 2605.16610: permanent "context window exceeds limit" 400 on
+# every attempt); 200k chars (~50-70k tokens) leaves headroom on
+# long-context models while keeping abstract/intro plus conclusions.
+AI_FULL_TEXT_MAX_CHARS = get_env_int("AI_FULL_TEXT_MAX_CHARS", 200_000, min_value=0)
 AI_FULL_TEXT_MIN_CHARS = get_env_int("AI_FULL_TEXT_MIN_CHARS", 2000, min_value=0)
 AI_DISABLE_THINKING = get_env_bool("AI_DISABLE_THINKING", True)
 AI_THINKING_EFFORT = (os.environ.get("AI_THINKING_EFFORT") or "").strip().lower() or None
@@ -510,6 +514,10 @@ def truncate_for_prompt(content: str, max_chars: int) -> str:
 
     head_chars = int(max_chars * 0.7)
     tail_chars = max_chars - head_chars
+    print(
+        f"Full text truncated for prompt: {len(content)} -> {max_chars} chars",
+        file=sys.stderr,
+    )
     return (
         content[:head_chars].rstrip()
         + "\n\n[Content truncated for model context]\n\n"
