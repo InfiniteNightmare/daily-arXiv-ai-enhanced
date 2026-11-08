@@ -404,7 +404,11 @@ jobs:
         if [ -z "$ai_request_timeout_seconds" ]; then ai_request_timeout_seconds="300"; fi
         if [ -z "$ai_circuit_breaker_failures" ]; then ai_circuit_breaker_failures="5"; fi
         if [ -z "$ai_input_source" ]; then ai_input_source="abstract"; fi
-        if [ -z "$ai_full_text_max_chars" ]; then ai_full_text_max_chars="0"; fi
+        # Must match the module default in ai/enhance.py: the exported value
+        # always overrides the module default, and 0 disables truncation —
+        # which permanently wedges book-size full texts on "context window
+        # exceeds limit" (arXiv 2605.16610).
+        if [ -z "$ai_full_text_max_chars" ]; then ai_full_text_max_chars="200000"; fi
         if [ -z "$ai_full_text_timeout_seconds" ]; then ai_full_text_timeout_seconds="20"; fi
         if [ -z "$ai_full_text_min_interval_seconds" ]; then ai_full_text_min_interval_seconds="0.5"; fi
         if [ -z "$ai_full_text_retry_attempts" ]; then ai_full_text_retry_attempts="2"; fi

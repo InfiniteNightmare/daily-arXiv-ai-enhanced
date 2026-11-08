@@ -19,6 +19,22 @@ class TestFullTextDefaultCap(unittest.TestCase):
         # (arXiv 2605.16610). The default must truncate.
         self.assertEqual(enhance.AI_FULL_TEXT_MAX_CHARS, 200_000)
 
+    def test_workflow_shell_default_matches_module_default(self):
+        # run.yml always exports AI_FULL_TEXT_MAX_CHARS; when the repo
+        # variable is unset its shell-side default wins over the module
+        # default. The two defaults must agree (2026-11-08: the workflow
+        # default was still "0" and silently disabled the module fix).
+        workflow = (ROOT_DIR / ".github" / "workflows" / "run.yml").read_text(
+            encoding="utf-8"
+        )
+        match = __import__("re").search(
+            r'if \[ -z "\$ai_full_text_max_chars" \]; then '
+            r'ai_full_text_max_chars="(\d+)"; fi',
+            workflow,
+        )
+        self.assertIsNotNone(match, "run.yml ai_full_text_max_chars default not found")
+        self.assertEqual(int(match.group(1)), enhance.AI_FULL_TEXT_MAX_CHARS)
+
 
 class TestTruncateForPrompt(unittest.TestCase):
     def test_short_content_passes_through_untruncated(self):
